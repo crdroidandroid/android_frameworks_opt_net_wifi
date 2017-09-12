@@ -342,6 +342,7 @@ public class XmlUtil {
         public static final String XML_TAG_LAST_CONNECT_UID = "LastConnectUid";
         public static final String XML_TAG_IS_LEGACY_PASSPOINT_CONFIG = "IsLegacyPasspointConfig";
         public static final String XML_TAG_ROAMING_CONSORTIUM_OIS = "RoamingConsortiumOIs";
+        public static final String XML_TAG_AUTO_CONNECT = "AutoConnect";
 
         /**
          * Write WepKeys to the XML stream.
@@ -459,6 +460,7 @@ public class XmlUtil {
                     configuration.isLegacyPasspointConfig);
             XmlUtil.writeNextValue(
                     out, XML_TAG_ROAMING_CONSORTIUM_OIS, configuration.roamingConsortiumIds);
+            XmlUtil.writeNextValue(out, XML_TAG_AUTO_CONNECT, configuration.autoConnect);
         }
 
         /**
@@ -620,6 +622,9 @@ public class XmlUtil {
                         break;
                     case XML_TAG_ROAMING_CONSORTIUM_OIS:
                         configuration.roamingConsortiumIds = (long[]) value;
+                        break;
+                    case XML_TAG_AUTO_CONNECT:
+                        configuration.autoConnect = (int) value;
                         break;
                     default:
                         throw new XmlPullParserException(

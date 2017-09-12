@@ -823,6 +823,10 @@ public class WifiConfigManager {
             internalConfig.enterpriseConfig.copyFromExternal(
                     externalConfig.enterpriseConfig, PASSWORD_MASK);
         }
+
+        if (externalConfig.autoConnect != WifiConfiguration.AUTOCONNECT_INVALID) {
+            internalConfig.autoConnect = externalConfig.autoConnect;
+        }
     }
 
     /**
@@ -856,6 +860,8 @@ public class WifiConfigManager {
         configuration.status = WifiConfiguration.Status.DISABLED;
         configuration.getNetworkSelectionStatus().setNetworkSelectionStatus(
                 NetworkSelectionStatus.NETWORK_SELECTION_PERMANENTLY_DISABLED);
+
+        configuration.autoConnect = WifiConfiguration.AUTOCONNECT_ENABLED;
     }
 
     /**
@@ -912,13 +918,19 @@ public class WifiConfigManager {
             WifiConfiguration internalConfig, WifiConfiguration externalConfig, int uid) {
         WifiConfiguration newInternalConfig = new WifiConfiguration(internalConfig);
 
-        // Copy over all the public elements from the provided configuration.
-        mergeWithInternalWifiConfiguration(newInternalConfig, externalConfig);
+        // When autoConnect is changed, other configs should not be changed.
+        if (externalConfig.autoConnect != WifiConfiguration.AUTOCONNECT_INVALID
+                && newInternalConfig.autoConnect != externalConfig.autoConnect) {
+            newInternalConfig.autoConnect = externalConfig.autoConnect;
+        } else {
+            // Copy over all the public elements from the provided configuration.
+            mergeWithInternalWifiConfiguration(newInternalConfig, externalConfig);
 
-        // Add debug information for network update.
-        newInternalConfig.lastUpdateUid = uid;
-        newInternalConfig.lastUpdateName = mContext.getPackageManager().getNameForUid(uid);
-        newInternalConfig.updateTime = createDebugTimeStampString(mClock.getWallClockMillis());
+            // Add debug information for network update.
+            newInternalConfig.lastUpdateUid = uid;
+            newInternalConfig.lastUpdateName = mContext.getPackageManager().getNameForUid(uid);
+            newInternalConfig.updateTime = createDebugTimeStampString(mClock.getWallClockMillis());
+        }
 
         return newInternalConfig;
     }

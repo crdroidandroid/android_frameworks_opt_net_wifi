@@ -19,6 +19,7 @@ package com.android.server.wifi;
 import android.content.Context;
 import android.net.wifi.ScanResult;
 import android.net.wifi.WifiConfiguration;
+import android.text.TextUtils;
 import android.util.LocalLog;
 import android.util.Pair;
 
@@ -258,6 +259,12 @@ public class SavedNetworkEvaluator implements WifiNetworkSelector.NetworkEvaluat
             }
 
             for (WifiConfiguration network : associatedConfigurations) {
+                // Skip network if it is marked as no automatic connect.
+                // This means that the user must manually select the network.
+                if (network.autoConnect != WifiConfiguration.AUTOCONNECT_ENABLED
+                        && !TextUtils.equals(scanResult.BSSID, currentBssid)) {
+                    continue;
+                }
                 /**
                  * Ignore Passpoint and Ephemeral networks. They are configured networks,
                  * but without being persisted to the storage. They are evaluated by
