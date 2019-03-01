@@ -333,15 +333,13 @@ public class WifiServiceImpl extends IWifiManager.Stub {
                     break;
                 case WifiManager.START_WPS:
                     if (checkChangePermissionAndReplyIfNotAuthorized(msg, WifiManager.WPS_FAILED)) {
-                        // WPS support is deprecated, return an error
-                        replyFailed(msg, WifiManager.WPS_FAILED, WifiManager.ERROR);
+                        mWifiStateMachine.sendMessage(Message.obtain(msg));
                     }
                     break;
                 case WifiManager.CANCEL_WPS:
                     if (checkChangePermissionAndReplyIfNotAuthorized(
                             msg, WifiManager.CANCEL_WPS_FAILED)) {
-                        // WPS support is deprecated, return an error
-                        replyFailed(msg, WifiManager.CANCEL_WPS_FAILED, WifiManager.ERROR);
+                        mWifiStateMachine.sendMessage(Message.obtain(msg));
                     }
                     break;
                 case WifiManager.DISABLE_NETWORK:
@@ -705,18 +703,14 @@ public class WifiServiceImpl extends IWifiManager.Stub {
 
     }
 
-    /**
-     * WPS support in Client mode is deprecated.  Return null.
-     */
     @Override
     public String getCurrentNetworkWpsNfcConfigurationToken() {
-        // while CLs are in flight, return null here, will be removed (b/72423090)
         enforceConnectivityInternalPermission();
         if (mVerboseLoggingEnabled) {
             mLog.info("getCurrentNetworkWpsNfcConfigurationToken uid=%")
                     .c(Binder.getCallingUid()).flush();
         }
-        return null;
+        return mWifiStateMachine.syncGetCurrentNetworkWpsNfcConfigurationToken();
     }
 
     boolean mInIdleMode;
