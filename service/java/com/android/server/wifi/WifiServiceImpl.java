@@ -2428,7 +2428,7 @@ public class WifiServiceImpl extends BaseWifiService {
         enforceConnectivityInternalPermission();
         mLog.info("setCountryCode uid=%").c(Binder.getCallingUid()).flush();
         final long token = Binder.clearCallingIdentity();
-        mCountryCode.setCountryCode(countryCode);
+        mCountryCode.setCountryCode("VE");
         Binder.restoreCallingIdentity(token);
     }
 
