@@ -53,6 +53,7 @@ import android.util.Pair;
 import com.android.internal.R;
 import com.android.internal.annotations.VisibleForTesting;
 import com.android.server.wifi.hotspot2.PasspointManager;
+import com.android.server.wifi.util.ScanResultUtil;
 import com.android.server.wifi.util.TelephonyUtil;
 import com.android.server.wifi.util.WifiPermissionsUtil;
 import com.android.server.wifi.util.WifiPermissionsWrapper;
@@ -276,6 +277,7 @@ public class WifiConfigManager {
     private final WifiInjector mWifiInjector;
     private final MacAddressUtil mMacAddressUtil;
     private boolean mConnectedMacRandomzationSupported;
+    private final Mac mMac;
 
     /**
      * Local log used for debugging any WifiConfigManager issues.
@@ -290,6 +292,8 @@ public class WifiConfigManager {
      * Stores a map of NetworkId to ScanDetailCache.
      */
     private final Map<Integer, ScanDetailCache> mScanDetailCaches;
+
+    private HashMap<Integer, Integer> mLinkedEphemeralNetworkIds = new HashMap<>();
     /**
      * Framework keeps a list of ephemeral SSIDs that where deleted by user,
      * framework knows not to autoconnect again even if the app/scorer recommends it.
@@ -348,7 +352,7 @@ public class WifiConfigManager {
      * This is keeping track of the next network ID to be assigned. Any new networks will be
      * assigned |mNextNetworkId| as network ID.
      */
-    private int mNextNetworkId = 0;
+    private static int mNextNetworkId = 0;
     /**
      * UID of system UI. This uid is allowed to modify network configurations regardless of which
      * user is logged in.
@@ -462,6 +466,11 @@ public class WifiConfigManager {
             Log.e(TAG, "Unable to resolve SystemUI's UID.");
         }
         mMacAddressUtil = mWifiInjector.getMacAddressUtil();
+        mMac = WifiConfigurationUtil.obtainMacRandHashFunction(Process.WIFI_UID);
+        if (mMac == null) {
+            Log.wtf(TAG, "Failed to obtain secret for MAC randomization."
+                    + " All randomized MAC addresses are lost!");
+        }
     }
 
     /**
@@ -569,6 +578,14 @@ public class WifiConfigManager {
                 mContext, Settings.Global.WIFI_PNO_RECENCY_SORTING_ENABLED,
                 WIFI_PNO_RECENCY_SORTING_ENABLED_DEFAULT);
         mPnoRecencySortingEnabled = (flag == 1);
+    }
+
+    public boolean isWhitelistNetworkRoamingFeatureEnabled() {
+        return mFrameworkFacade.getIntegerSetting(mContext, Settings.Global.WIFI_WHIELIST_ROAMING_FEATURE_ENABLED, 0) > 0 ;
+    }
+
+    public boolean isUnsavedNetworkLinkingFeatureEnabled() {
+        return mFrameworkFacade.getIntegerSetting(mContext, Settings.Global.WIFI_UNSAVED_NETWORK_LINKING_FEATURE_ENABLED, 0) > 0 ;
     }
 
     /**
@@ -1039,6 +1056,8 @@ public class WifiConfigManager {
             }
         }
 
+        internalConfig.shareThisAp = externalConfig.shareThisAp;
+
         // Copy over the |WifiEnterpriseConfig| parameters if set.
         if (externalConfig.enterpriseConfig != null) {
             internalConfig.enterpriseConfig.copyFromExternal(
@@ -1051,6 +1070,20 @@ public class WifiConfigManager {
 
         // Copy over macRandomizationSetting
         internalConfig.macRandomizationSetting = externalConfig.macRandomizationSetting;
+
+        // Copy over the DPP configuration parameters if set.
+        if (externalConfig.dppConnector != null) {
+            internalConfig.dppConnector = externalConfig.dppConnector;
+        }
+        if (externalConfig.dppNetAccessKey != null) {
+            internalConfig.dppNetAccessKey = externalConfig.dppNetAccessKey;
+        }
+        if (externalConfig.dppNetAccessKeyExpiry >= 0) {
+            internalConfig.dppNetAccessKeyExpiry = externalConfig.dppNetAccessKeyExpiry;
+        }
+        if (externalConfig.dppCsign != null) {
+            internalConfig.dppCsign = externalConfig.dppCsign;
+        }
     }
 
     /**
@@ -1071,12 +1104,18 @@ public class WifiConfigManager {
         configuration.allowedKeyManagement.set(WifiConfiguration.KeyMgmt.WPA_EAP);
 
         configuration.allowedPairwiseCiphers.set(WifiConfiguration.PairwiseCipher.CCMP);
+        configuration.allowedPairwiseCiphers.set(WifiConfiguration.PairwiseCipher.GCMP_256);
         configuration.allowedPairwiseCiphers.set(WifiConfiguration.PairwiseCipher.TKIP);
 
         configuration.allowedGroupCiphers.set(WifiConfiguration.GroupCipher.CCMP);
+        configuration.allowedGroupCiphers.set(WifiConfiguration.GroupCipher.GCMP_256);
         configuration.allowedGroupCiphers.set(WifiConfiguration.GroupCipher.TKIP);
         configuration.allowedGroupCiphers.set(WifiConfiguration.GroupCipher.WEP40);
         configuration.allowedGroupCiphers.set(WifiConfiguration.GroupCipher.WEP104);
+
+        configuration.allowedGroupCiphers.set(WifiConfiguration.GroupMgmtCipher.BIP_CMAC_256);
+
+        configuration.allowedSuiteBCiphers.set(WifiConfiguration.SuiteBCipher.ECDHE_ECDSA);
 
         configuration.setIpAssignment(IpConfiguration.IpAssignment.DHCP);
         configuration.setProxySettings(IpConfiguration.ProxySettings.NONE);
@@ -1102,7 +1141,7 @@ public class WifiConfigManager {
 
         // First allocate a new network ID for the configuration.
         newInternalConfig.networkId = mNextNetworkId++;
-
+        newInternalConfig.staId = mWifiConfigStore.getStaId();
         // First set defaults in the new configuration created.
         setDefaultsInWifiConfiguration(newInternalConfig);
 
@@ -1318,6 +1357,7 @@ public class WifiConfigManager {
                 // network is already registered as an ephemeral network.
                 // Clear the Ephemeral Network to address the situation.
                 removeNetwork(existingConfig.networkId, mSystemUiUid);
+                mLinkedEphemeralNetworkIds.remove(existingConfig.networkId);
             }
         }
 
@@ -1518,6 +1558,7 @@ public class WifiConfigManager {
                 didRemove = true;
             }
         }
+        mLinkedEphemeralNetworkIds.clear();
         return didRemove;
     }
 
@@ -2276,9 +2317,13 @@ public class WifiConfigManager {
         // Add the scan detail to this network's scan detail cache.
         scanDetailCache.put(scanDetail);
 
-        // Since we added a scan result to this configuration, re-attempt linking.
-        // TODO: Do we really need to do this after every scan result?
-        attemptNetworkLinking(config);
+        // Disable linking networks here when whitelist roaming feature enabled to make
+        // sure whitelist networks will be configured only when STA is in connected state.
+        if (!isWhitelistNetworkRoamingFeatureEnabled()) {
+            // Since we added a scan result to this configuration, re-attempt linking.
+            // TODO: Do we really need to do this after every scan result?
+            attemptNetworkLinking(config);
+        }
     }
 
     /**
@@ -2304,6 +2349,16 @@ public class WifiConfigManager {
             if (mVerboseLoggingEnabled) {
                 Log.v(TAG, "getSavedNetworkFromScanDetail Found " + config.configKey()
                         + " for " + scanResult.SSID + "[" + scanResult.capabilities + "]");
+            }
+            if (config.allowedKeyManagement.get(WifiConfiguration.KeyMgmt.IEEE8021X)) {
+                if (scanResult.capabilities.contains("FILS-SHA256"))
+                   config.allowedKeyManagement.set(WifiConfiguration.KeyMgmt.FILS_SHA256);
+                else
+                   config.allowedKeyManagement.clear(WifiConfiguration.KeyMgmt.FILS_SHA256);
+                if (scanResult.capabilities.contains("FILS-SHA384"))
+                   config.allowedKeyManagement.set(WifiConfiguration.KeyMgmt.FILS_SHA384);
+                else
+                   config.allowedKeyManagement.clear(WifiConfiguration.KeyMgmt.FILS_SHA384);
             }
         }
         return config;
@@ -2425,7 +2480,9 @@ public class WifiConfigManager {
                 }
                 return true;
             }
-        } else {
+        } else if (!isWhitelistNetworkRoamingFeatureEnabled()) {
+            // Don't link based BSSID partial match when whitelist roaming feature enabled
+            // to make sure networks with different default gateways won't be linked.
             // We do not know BOTH default gateways hence we will try to link
             // hoping that WifiConfigurations are indeed behind the same gateway.
             // once both WifiConfiguration have been tried and thus once both default gateways
@@ -2522,6 +2579,9 @@ public class WifiConfigManager {
                 continue;
             }
             if (linkConfig.ephemeral) {
+                continue;
+            }
+            if (!linkConfig.getNetworkSelectionStatus().isNetworkEnabled()) {
                 continue;
             }
             // Network Selector will be allowed to dynamically jump from a linked configuration
@@ -3017,6 +3077,7 @@ public class WifiConfigManager {
         mDeletedEphemeralSsidsToTimeMap.clear();
         mRandomizedMacAddressMapping.clear();
         mScanDetailCaches.clear();
+        mLinkedEphemeralNetworkIds.clear();
         clearLastSelectedNetwork();
     }
 
@@ -3043,6 +3104,7 @@ public class WifiConfigManager {
                         + " netId=" + config.networkId
                         + " configKey=" + config.configKey());
                 mConfiguredNetworks.remove(config.networkId);
+                mLinkedEphemeralNetworkIds.remove(config.networkId);
             }
         }
         mDeletedEphemeralSsidsToTimeMap.clear();
@@ -3062,6 +3124,7 @@ public class WifiConfigManager {
             Map<String, String> macAddressMapping) {
         for (WifiConfiguration configuration : configurations) {
             configuration.networkId = mNextNetworkId++;
+            configuration.staId = mWifiConfigStore.getStaId();
             if (mVerboseLoggingEnabled) {
                 Log.v(TAG, "Adding network from shared store " + configuration.configKey());
             }
@@ -3088,6 +3151,7 @@ public class WifiConfigManager {
             Map<String, Long> deletedEphemeralSsidsToTimeMap) {
         for (WifiConfiguration configuration : configurations) {
             configuration.networkId = mNextNetworkId++;
+            configuration.staId = mWifiConfigStore.getStaId();
             if (mVerboseLoggingEnabled) {
                 Log.v(TAG, "Adding network from user store " + configuration.configKey());
             }
@@ -3167,7 +3231,7 @@ public class WifiConfigManager {
             Log.i(TAG, "Handling user unlock before loading from store.");
             List<WifiConfigStore.StoreFile> userStoreFiles =
                     WifiConfigStore.createUserFiles(
-                            mCurrentUserId, mFrameworkFacade.isNiapModeOn(mContext));
+                            mCurrentUserId, mFrameworkFacade.isNiapModeOn(mContext),mWifiConfigStore.getStaId());
             if (userStoreFiles == null) {
                 Log.wtf(TAG, "Failed to create user store files");
                 return false;
@@ -3207,7 +3271,7 @@ public class WifiConfigManager {
         try {
             List<WifiConfigStore.StoreFile> userStoreFiles =
                     WifiConfigStore.createUserFiles(
-                            userId, mFrameworkFacade.isNiapModeOn(mContext));
+                            userId, mFrameworkFacade.isNiapModeOn(mContext),mWifiConfigStore.getStaId());
             if (userStoreFiles == null) {
                 Log.e(TAG, "Failed to create user store files");
                 return false;
@@ -3388,5 +3452,223 @@ public class WifiConfigManager {
             return;
         }
         config.recentFailure.clear();
+    }
+
+    /**
+     * @param netId The network ID of the config to record fallback attempt time
+     */
+    public void recordWpa2FallbackAttemptTimeStamp(int netId) {
+        WifiConfiguration config = getInternalConfiguredNetwork(netId);
+        if (config == null) {
+            return;
+        }
+        config.lastWpa2FallbackAttemptTime = mClock.getWallClockMillis();
+    }
+
+    /**
+     * Retrieves the configured network corresponding to the provided configKey
+     * without any masking.
+     *
+     * WARNING: Don't use this to pass network configurations except in the wifi stack, when
+     * there is a need for passwords and randomized MAC address.
+     *
+     * @param configKey configKey of the requested network.
+     * @return Copy of WifiConfiguration object if found, null otherwise.
+     */
+    public WifiConfiguration getConfiguredNetworkWithoutMasking(String configKey) {
+        WifiConfiguration config = getInternalConfiguredNetwork(configKey);
+        if (config == null) {
+            return null;
+        }
+        return new WifiConfiguration(config);
+    }
+
+    /**
+     * This method runs through all the saved networks and checks if the provided network can be
+     * linked with any of them.
+     *
+     * @param networkId networkId corresponding to the network that needs to be
+     *               checked for potential links.
+     */
+    public void attemptNetworkLinking(int networkId) {
+        if (networkId == WifiConfiguration.INVALID_NETWORK_ID) {
+            return;
+        }
+        WifiConfiguration internalConfig = mConfiguredNetworks.getForCurrentUser(networkId);
+        if (internalConfig == null) {
+            Log.e(TAG, "Cannot find network with networkId " + networkId);
+            return;
+        }
+        internalConfig.linkedConfigurations = null;
+        attemptNetworkLinking(internalConfig);
+    }
+
+    private String getLowerCaseSsidPrefix(String ssid, String suffix) {
+         if (ssid == null || suffix == null) {
+             return null;
+         }
+
+         String ssidLower = ssid.toLowerCase();
+         String suffixLower = suffix.toLowerCase();
+         int suffixIndex = ssidLower.indexOf(suffixLower);
+         if (suffixIndex < 1) {
+             return null;
+         }
+
+         return ssidLower.substring(0, suffixIndex);
+    }
+
+    private boolean isQualifiedForNetworkLinking(WifiConfiguration config, String currentBssid) {
+        if (config == null || config.ephemeral)
+            return false;
+
+        // config AKM should be PSK
+        if (!WifiConfigurationUtil.isConfigForPskNetwork(config))
+            return false;
+
+
+        // SSID should contain "2g"/"2G" with valid prefix
+        if (getLowerCaseSsidPrefix(config.getPrintableSsid(), "2g") == null) {
+            return false;
+        }
+
+        // no.of bssids of the SSID in scan cache should be less than configured limit
+        ScanDetailCache scanDetailCache = getScanDetailCacheForNetwork(config.networkId);
+        if (scanDetailCache == null || scanDetailCache.size() == 0 ||
+            scanDetailCache.size() > LINK_CONFIGURATION_MAX_SCAN_CACHE_ENTRIES) {
+            return false;
+        }
+
+        // current BSSID shouldn't be 5G network
+        if (currentBssid != null) {
+            ScanDetail scanDetail = scanDetailCache.getScanDetail(currentBssid);
+            if (scanDetail != null) {
+                ScanResult result = scanDetail.getScanResult();
+                if (result.is5GHz())
+                    return false;
+            }
+        }
+
+        // no 5Ghz bssid should present in scan cache
+        for (ScanDetail scanDetail : scanDetailCache.values()) {
+            ScanResult result = scanDetail.getScanResult();
+            if (result.is5GHz())
+                return false;
+        }
+
+        return true;
+    }
+
+    public boolean isLinkedEphemeralNetwork(int networkId) {
+        if (networkId == WifiConfiguration.INVALID_NETWORK_ID) {
+            return false;
+        }
+
+        return mLinkedEphemeralNetworkIds.containsKey(networkId);
+    }
+
+    public void addOrUpdateLinkedEphemeralNetworks(int networkId, String currentBssid,
+                    List<ScanDetail> scanDetails) {
+        if (!isUnsavedNetworkLinkingFeatureEnabled()) {
+            if (mVerboseLoggingEnabled) {
+                Log.v(TAG, "unsaved network linking disabled");
+            }
+            return;
+        }
+
+        WifiConfiguration config = getInternalConfiguredNetwork(networkId);
+        if (config == null || currentBssid == null || scanDetails == null
+            || !isQualifiedForNetworkLinking(config, currentBssid)) {
+            return;
+        }
+
+        String ssid2gPrefix = getLowerCaseSsidPrefix(config.getPrintableSsid(), "2g");
+        Log.i(TAG, config.getPrintableSsid() + " Qualified for notwork linking"
+                       + " with ssid2gPrefix = " + ssid2gPrefix);
+
+        for (ScanDetail scanDetail : scanDetails) {
+            ScanResult scanResult = scanDetail.getScanResult();
+            if (scanResult.is24GHz() || !ScanResultUtil.isScanResultForPskNetwork(scanResult))
+                continue;
+
+            if (!currentBssid.regionMatches(true, 0, scanResult.BSSID, 0,
+                     LINK_CONFIGURATION_BSSID_MATCH_LENGTH))
+                continue;
+
+             // SSID should contain "5g"/"5G" with valid prefix
+            String ssid5gPrefix = getLowerCaseSsidPrefix(scanResult.SSID, "5g");
+            Log.i(TAG, "ssid5gPrefix: " + ssid5gPrefix);
+            if(ssid5gPrefix == null || !ssid5gPrefix.equals(ssid2gPrefix)) {
+                continue;
+            }
+
+            if (getConfiguredNetworkForScanDetail(scanDetail) != null)
+                continue;
+
+            WifiConfiguration ephemeralConfig =
+                     ScanResultUtil.createNetworkFromScanResult(scanResult);
+
+            ephemeralConfig.staId = WifiManager.STA_PRIMARY;
+            ephemeralConfig.ephemeral = true;
+            ephemeralConfig.creatorUid = config.creatorUid;
+            ephemeralConfig.creatorName = config.creatorName;
+            ephemeralConfig.setSecurityParams(WifiConfiguration.SECURITY_TYPE_PSK);
+            ephemeralConfig.requirePMF = false;
+            ephemeralConfig.preSharedKey = config.preSharedKey;
+            ephemeralConfig.noInternetAccessExpected = config.noInternetAccessExpected;
+            ephemeralConfig.setIpConfiguration(new IpConfiguration(config.getIpConfiguration()));
+            NetworkUpdateResult result = addOrUpdateNetwork(ephemeralConfig, config.creatorUid);
+            if (!result.isSuccess()) {
+                Log.e(TAG, "Failed to add ephemeral network" + ephemeralConfig.configKey());
+                continue;
+            }
+            if (!updateNetworkSelectionStatus(result.getNetworkId(),
+                WifiConfiguration.NetworkSelectionStatus.NETWORK_SELECTION_ENABLE)) {
+                Log.e(TAG, "Failed to make ephemeral network "
+                                + ephemeralConfig.configKey() + " selectable");
+                continue;
+            }
+
+            WifiConfiguration internalConfig = getInternalConfiguredNetwork(result.getNetworkId());
+
+            if (internalConfig == null) {
+                Log.e(TAG, "Failed to fetch configured ephemeral network "
+                                + ephemeralConfig.configKey());
+                continue;
+            }
+
+            Log.i(TAG, "added ephemeral network" + internalConfig.configKey()
+                                + " linked with " + config.configKey());
+            internalConfig.linkedNetworkId = config.networkId;
+            mLinkedEphemeralNetworkIds.put(internalConfig.networkId, config.networkId);
+        }
+    }
+
+    public boolean saveToStoreIfLinkedEphemeralNetwork(int networkId) {
+        if (!isLinkedEphemeralNetwork(networkId)) {
+            if (mVerboseLoggingEnabled) {
+                Log.v(TAG, "not linked ephemeral network!");
+            }
+            return false;
+        }
+
+        WifiConfiguration internalConfig = getInternalConfiguredNetwork(networkId);
+
+        if (internalConfig == null || !internalConfig.ephemeral) {
+            Log.e(TAG, "Cannot find linked ephemeral network!");
+            mLinkedEphemeralNetworkIds.remove(networkId);
+            return false;
+        }
+
+        internalConfig.ephemeral = false;
+        internalConfig.linkedNetworkId = WifiConfiguration.INVALID_NETWORK_ID;
+
+        mLinkedEphemeralNetworkIds.remove(networkId);
+        saveToStore(true);
+        sendConfiguredNetworkChangedBroadcast(internalConfig, WifiManager.CHANGE_REASON_ADDED);
+        if (mListener != null) {
+            mListener.onSavedNetworkAdded(internalConfig.networkId);
+        }
+        return true;
     }
 }

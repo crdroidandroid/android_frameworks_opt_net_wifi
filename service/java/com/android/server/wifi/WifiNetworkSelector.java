@@ -27,6 +27,7 @@ import android.net.wifi.ScanResult;
 import android.net.wifi.SupplicantState;
 import android.net.wifi.WifiConfiguration;
 import android.net.wifi.WifiInfo;
+import android.net.wifi.WifiManager;
 import android.text.TextUtils;
 import android.util.ArrayMap;
 import android.util.ArraySet;
@@ -216,6 +217,8 @@ public class WifiNetworkSelector {
     // be retrieved in bugreport.
     private void localLog(String log) {
         mLocalLog.log(log);
+        // TODO: UT: control this by verbose logging.
+        Log.d(TAG, log);
     }
 
     private boolean isCurrentNetworkSufficient(WifiInfo wifiInfo, List<ScanDetail> scanDetails) {
@@ -751,7 +754,9 @@ public class WifiNetworkSelector {
                         if (config != null) {
                             mConnectableNetworks.add(Pair.create(scanDetail, config));
                             mNetworkIds.add(config.networkId);
-                            if (config.networkId == lastUserSelectedNetworkId) {
+                            if (lastUserSelectedNetworkId != WifiConfiguration.INVALID_NETWORK_ID
+                                && (config.networkId == lastUserSelectedNetworkId)
+                                || (config.linkedNetworkId == lastUserSelectedNetworkId)) {
                                 wifiCandidates.add(scanDetail, config,
                                         registeredEvaluator.getId(), score, lastSelectionWeight);
                             } else {
@@ -977,4 +982,6 @@ public class WifiNetworkSelector {
         mStayOnNetworkMinimumRxRate = context.getResources().getInteger(
                 R.integer.config_wifi_framework_min_rx_rate_for_staying_on_network);
     }
+
+
 }

@@ -243,10 +243,13 @@ public class WifiConfigManagerTest {
         // static mocking
         mSession = ExtendedMockito.mockitoSession()
                 .mockStatic(WifiConfigStore.class, withSettings().lenient())
+                .spyStatic(WifiConfigurationUtil.class)
                 .strictness(Strictness.LENIENT)
                 .startMocking();
         when(WifiConfigStore.createUserFiles(anyInt(), anyBoolean())).thenReturn(mock(List.class));
         when(mTelephonyManager.createForSubscriptionId(anyInt())).thenReturn(mDataTelephonyManager);
+        when(WifiConfigurationUtil.calculatePersistentMacForConfiguration(any(), any()))
+                .thenReturn(TEST_RANDOMIZED_MAC);
         verify(mDeviceConfigFacade).addOnPropertiesChangedListener(any(),
                 mOnPropertiesChangedListenerCaptor.capture());
     }

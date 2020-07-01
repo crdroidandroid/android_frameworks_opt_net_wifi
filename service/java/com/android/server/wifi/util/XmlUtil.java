@@ -350,6 +350,12 @@ public class XmlUtil {
         public static final String XML_TAG_ROAMING_CONSORTIUM_OIS = "RoamingConsortiumOIs";
         public static final String XML_TAG_RANDOMIZED_MAC_ADDRESS = "RandomizedMacAddress";
         public static final String XML_TAG_MAC_RANDOMIZATION_SETTING = "MacRandomizationSetting";
+        public static final String XML_TAG_SHARE_THIS_AP = "ShareThisAp";
+
+        public static final String XML_TAG_DPP_CONNECTOR = "DppConnector";
+        public static final String XML_TAG_DPP_NETACCESSKEY = "DppNetAccessKey";
+        public static final String XML_TAG_DPP_NETACCESSKEY_EXPIRY = "DppNetAccessKeyExpiry";
+        public static final String XML_TAG_DPP_CSIGN = "DppCsign";
 
         /**
          * Write WepKeys to the XML stream.
@@ -423,6 +429,7 @@ public class XmlUtil {
             XmlUtil.writeNextValue(out, XML_TAG_CONFIG_KEY, configuration.configKey());
             XmlUtil.writeNextValue(out, XML_TAG_SSID, configuration.SSID);
             XmlUtil.writeNextValue(out, XML_TAG_BSSID, configuration.BSSID);
+            XmlUtil.writeNextValue(out, XML_TAG_SHARE_THIS_AP, configuration.shareThisAp);
             writePreSharedKeyToXml(out, configuration.preSharedKey, encryptionUtil);
             writeWepKeysToXml(out, configuration.wepKeys);
             XmlUtil.writeNextValue(out, XML_TAG_WEP_TX_KEY_INDEX, configuration.wepTxKeyIndex);
@@ -513,6 +520,11 @@ public class XmlUtil {
                     configuration.getRandomizedMacAddress().toString());
             XmlUtil.writeNextValue(out, XML_TAG_MAC_RANDOMIZATION_SETTING,
                     configuration.macRandomizationSetting);
+
+            XmlUtil.writeNextValue(out, XML_TAG_DPP_CONNECTOR, configuration.dppConnector);
+            XmlUtil.writeNextValue(out, XML_TAG_DPP_NETACCESSKEY, configuration.dppNetAccessKey);
+            XmlUtil.writeNextValue(out, XML_TAG_DPP_NETACCESSKEY_EXPIRY, configuration.dppNetAccessKeyExpiry);
+            XmlUtil.writeNextValue(out, XML_TAG_DPP_CSIGN, configuration.dppCsign);
         }
 
         /**
@@ -578,6 +590,9 @@ public class XmlUtil {
                             break;
                         case XML_TAG_BSSID:
                             configuration.BSSID = (String) value;
+                            break;
+                        case XML_TAG_SHARE_THIS_AP:
+                            configuration.shareThisAp = (boolean) value;
                             break;
                         case XML_TAG_PRE_SHARED_KEY:
                             configuration.preSharedKey = (String) value;
@@ -698,6 +713,18 @@ public class XmlUtil {
                         case XML_TAG_RANDOMIZED_MAC_ADDRESS:
                             configuration.setRandomizedMacAddress(
                                     MacAddress.fromString((String) value));
+                            break;
+                        case XML_TAG_DPP_CONNECTOR:
+                            configuration.dppConnector = (String) value;
+                            break;
+                        case XML_TAG_DPP_NETACCESSKEY:
+                            configuration.dppNetAccessKey = (String) value;
+                            break;
+                        case XML_TAG_DPP_NETACCESSKEY_EXPIRY:
+                            configuration.dppNetAccessKeyExpiry = (int) value;
+                            break;
+                        case XML_TAG_DPP_CSIGN:
+                            configuration.dppCsign = (String) value;
                             break;
                         case XML_TAG_MAC_RANDOMIZATION_SETTING:
                             configuration.macRandomizationSetting = (int) value;
@@ -1084,6 +1111,7 @@ public class XmlUtil {
         public static final String XML_TAG_PHASE2_METHOD = "Phase2Method";
         public static final String XML_TAG_PLMN = "PLMN";
         public static final String XML_TAG_REALM = "Realm";
+        public static final String XML_TAG_SIMNUM = "SimNum";
 
         /**
          * Write password key to the XML stream.
@@ -1154,6 +1182,7 @@ public class XmlUtil {
             XmlUtil.writeNextValue(out, XML_TAG_PHASE2_METHOD, enterpriseConfig.getPhase2Method());
             XmlUtil.writeNextValue(out, XML_TAG_PLMN, enterpriseConfig.getPlmn());
             XmlUtil.writeNextValue(out, XML_TAG_REALM, enterpriseConfig.getRealm());
+            XmlUtil.writeNextValue(out, XML_TAG_SIMNUM, enterpriseConfig.getSimNum());
         }
 
         /**
@@ -1247,6 +1276,17 @@ public class XmlUtil {
                             break;
                         case XML_TAG_REALM:
                             enterpriseConfig.setRealm((String) value);
+                            break;
+                        case XML_TAG_SIMNUM:
+                            int sim_num;
+                            try {
+                                sim_num = Integer.parseInt((String) value);
+                            } catch (NumberFormatException e) {
+                                sim_num = -1;
+                            }
+                            if (sim_num > 0) {
+                                enterpriseConfig.setSimNum(sim_num);
+                            }
                             break;
                         default:
                             throw new XmlPullParserException(

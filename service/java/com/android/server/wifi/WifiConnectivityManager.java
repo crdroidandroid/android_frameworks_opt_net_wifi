@@ -31,6 +31,7 @@ import android.net.wifi.WifiInfo;
 import android.net.wifi.WifiManager;
 import android.net.wifi.WifiManager.DeviceMobilityState;
 import android.net.wifi.WifiScanner;
+import android.net.wifi.p2p.WifiP2pManager;
 import android.net.wifi.WifiScanner.PnoSettings;
 import android.net.wifi.WifiScanner.ScanSettings;
 import android.os.Handler;
@@ -155,10 +156,12 @@ public class WifiConnectivityManager {
     private WifiScanner mScanner;
 
     private boolean mDbg = false;
+    private boolean DBG = false;
     private boolean mWifiEnabled = false;
     private boolean mWifiConnectivityManagerEnabled = false;
     private boolean mRunning = false;
     private boolean mScreenOn = false;
+    private int mMiracastMode = WifiP2pManager.MIRACAST_DISABLED;
     private int mWifiState = WIFI_STATE_UNKNOWN;
     private boolean mUntrustedConnectionAllowed = false;
     private boolean mTrustedConnectionAllowed = false;
@@ -174,7 +177,7 @@ public class WifiConnectivityManager {
     // Device configs
     private boolean mEnableAutoJoinWhenAssociated;
     private boolean mWaitForFullBandScanResults = false;
-    private boolean mUseSingleRadioChainScanResults = false;
+    private boolean mUseSingleRadioChainScanResults = true;
     private int mFullScanMaxTxRate;
     private int mFullScanMaxRxRate;
 
@@ -209,6 +212,19 @@ public class WifiConnectivityManager {
     // be retrieved in bugreport.
     private void localLog(String log) {
         mLocalLog.log(log);
+        if (DBG)
+            Log.d(TAG, log);
+    }
+
+    /**
+     * Enable verbose logging for WifiCountryCode.
+     */
+    public void enableVerboseLogging(int verbose) {
+        if (verbose > 0) {
+            DBG = true;
+        } else {
+            DBG = false;
+        }
     }
 
     // A periodic/PNO scan will be rescheduled up to MAX_SCAN_RESTART_ALLOWED times
@@ -274,8 +290,10 @@ public class WifiConnectivityManager {
 
         localLog(listenerName + " onResults: start network selection");
 
+        List<ScanDetail> filteredScans = mStateMachine.qtiGetFilteredScan(scanDetails);
+
         WifiConfiguration candidate =
-                mNetworkSelector.selectNetwork(scanDetails, buildBssidBlacklist(), mWifiInfo,
+                mNetworkSelector.selectNetwork(filteredScans, buildBssidBlacklist(), mWifiInfo,
                 mStateMachine.isConnected(), mStateMachine.isDisconnected(),
                 mUntrustedConnectionAllowed);
         mWifiLastResortWatchdog.updateAvailableNetworks(
@@ -750,7 +768,8 @@ public class WifiConnectivityManager {
         if (currentConnectedNetwork != null
                 && (currentConnectedNetwork.networkId == candidate.networkId
                 //TODO(b/36788683): re-enable linked configuration check
-                /* || currentConnectedNetwork.isLinked(candidate) */)) {
+                 || (mConfigManager.isWhitelistNetworkRoamingFeatureEnabled()
+                      && currentConnectedNetwork.isLinked(candidate)))) {
             // Framework initiates roaming only if firmware doesn't support
             // {@link android.net.wifi.WifiManager#WIFI_FEATURE_CONTROL_ROAMING}.
             if (mConnectivityHelper.isFirmwareRoamingSupported()) {
@@ -766,8 +785,8 @@ public class WifiConnectivityManager {
             // Framework specifies the connection target BSSID if firmware doesn't support
             // {@link android.net.wifi.WifiManager#WIFI_FEATURE_CONTROL_ROAMING} or the
             // candidate configuration contains a specified BSSID.
-            if (mConnectivityHelper.isFirmwareRoamingSupported() && (candidate.BSSID == null
-                      || candidate.BSSID.equals(ClientModeImpl.SUPPLICANT_BSSID_ANY))) {
+            if (!mStateMachine.isActiveDualMode() && mConnectivityHelper.isFirmwareRoamingSupported()
+                && (candidate.BSSID == null || candidate.BSSID.equals(ClientModeImpl.SUPPLICANT_BSSID_ANY))) {
                 targetBssid = ClientModeImpl.SUPPLICANT_BSSID_ANY;
                 localLog("connectToNetwork: Connect to " + candidate.SSID + ":" + targetBssid
                         + " from " + currentAssociationId);
@@ -900,6 +919,17 @@ public class WifiConnectivityManager {
     // Start a single scan
     private void startSingleScan(boolean isFullBandScan, WorkSource workSource) {
         if (!mWifiEnabled || !mWifiConnectivityManagerEnabled) {
+            return;
+        }
+
+        // Any scans will impact wifi performance including WFD performance,
+        // So at least ignore scans triggered internally by ConnectivityManager
+        // when WFD session is active. We still allow connectivity scans initiated
+        // by other work source.
+        if (WIFI_WORK_SOURCE.equals(workSource) &&
+            (mMiracastMode == WifiP2pManager.MIRACAST_SOURCE ||
+            mMiracastMode == WifiP2pManager.MIRACAST_SINK)) {
+            Log.d(TAG,"ignore connectivity scan, MiracastMode:" + mMiracastMode);
             return;
         }
 
@@ -1134,7 +1164,6 @@ public class WifiConnectivityManager {
         // to provide periodic scan in an exponential backoff fashion.
         cancelPeriodicScanTimer();
         stopPnoScan();
-        mScanRestartCount = 0;
     }
 
     /**
@@ -1149,6 +1178,15 @@ public class WifiConnectivityManager {
         mCarrierNetworkNotifier.handleScreenStateChanged(screenOn);
 
         startConnectivityScan(SCAN_ON_SCHEDULE);
+    }
+
+    /**
+     * Save current miracast mode, it will be used to ignore
+     * connectivity scan during the time when miracast is enabled.
+     */
+    public void saveMiracastMode(int mode) {
+        Log.d(TAG,"saveMiracastMode: mode=" + mode);
+        mMiracastMode = mode;
     }
 
     /**
@@ -1408,8 +1446,27 @@ public class WifiConnectivityManager {
                     + blacklistedBssids.size());
         }
 
+        int maxWhitelistSize = mConnectivityHelper.getMaxNumWhitelistSsid();
+        if (maxWhitelistSize <= 0) {
+            Log.wtf(TAG, "Invalid max SSID whitelist size:  " + maxWhitelistSize);
+            return;
+        }
+
+        ArrayList<String> whitelistSsids = new ArrayList<String>(buildSsidWhitelist());
+        int whitelistSize = whitelistSsids.size();
+
+        if (whitelistSize > maxWhitelistSize) {
+            Log.wtf(TAG, "Attempt to write " + whitelistSize + " whitelisted SSIDs, max size is "
+                    + maxWhitelistSize);
+
+            whitelistSsids = new ArrayList<String>(whitelistSsids.subList(0,
+                    maxWhitelistSize));
+            localLog("Trim down SSID whitelist size from " + whitelistSize + " to "
+                    + whitelistSsids.size());
+        }
+
         if (!mConnectivityHelper.setFirmwareRoamingConfiguration(blacklistedBssids,
-                new ArrayList<String>())) {  // TODO(b/36488259): SSID whitelist management.
+                whitelistSsids)) {  // TODO(b/36488259): SSID whitelist management.
             localLog("Failed to set firmware roaming configuration.");
         }
     }
@@ -1488,6 +1545,7 @@ public class WifiConnectivityManager {
         mCarrierNetworkNotifier.clearPendingNotification(true /* resetRepeatDelay */);
         mLastConnectionAttemptBssid = null;
         mWaitForFullBandScanResults = false;
+        mScanRestartCount = 0;
     }
 
     /**
@@ -1547,5 +1605,72 @@ public class WifiConnectivityManager {
         mOpenNetworkNotifier.dump(fd, pw, args);
         mCarrierNetworkNotifier.dump(fd, pw, args);
         mCarrierNetworkConfig.dump(fd, pw, args);
+    }
+
+    public void configureWhitelistNetworks() {
+        if (!mConfigManager.isWhitelistNetworkRoamingFeatureEnabled()) {
+            Log.i(TAG, "whitelist roaming feature disabled");
+            return;
+        }
+
+        WifiConfiguration currentConnectedNetwork = mConfigManager
+            .getConfiguredNetwork(mWifiInfo.getNetworkId());
+
+        Log.i(TAG, "configureWhitelistNetworks");
+        if (currentConnectedNetwork == null) {
+            return;
+        }
+
+        HashMap<String, WifiConfiguration> whitelistNetworkConfigs = new HashMap<>();
+
+        if (currentConnectedNetwork.linkedConfigurations == null) {
+            Log.i(TAG, "Empty linked networks");
+            mConnectivityHelper.updateLinkedNetworksIfCurrent(
+                                    mWifiInfo.getNetworkId(), whitelistNetworkConfigs);
+            updateFirmwareRoamingConfiguration();
+            return;
+        }
+
+        Log.i(TAG, "Current network: " + currentConnectedNetwork.configKey());
+        Log.i(TAG, "Linked networks:");
+        for (String configKey : currentConnectedNetwork.linkedConfigurations.keySet()) {
+             Log.i(TAG, configKey);
+             whitelistNetworkConfigs.put(
+                     configKey, mConfigManager.getConfiguredNetworkWithoutMasking(configKey));
+        }
+
+        if (mConnectivityHelper.updateLinkedNetworksIfCurrent(
+                                   mWifiInfo.getNetworkId(), whitelistNetworkConfigs)) {
+             Log.i(TAG, "update firmware roaming configuration with whitelist networks");
+             updateFirmwareRoamingConfiguration();
+        }
+    }
+
+    /**
+     * Compile and return a hashset of the whitelisted SSIDs
+     */
+    private HashSet<String> buildSsidWhitelist() {
+        HashSet<String> whitelistedSsids = new HashSet<String>();
+
+        WifiConfiguration currentConnectedNetwork = mConfigManager
+            .getConfiguredNetwork(mWifiInfo.getNetworkId());
+
+        if (!mConfigManager.isWhitelistNetworkRoamingFeatureEnabled()
+                || currentConnectedNetwork == null
+                || !currentConnectedNetwork.validatedInternetAccess
+                || currentConnectedNetwork.linkedConfigurations == null) {
+            return whitelistedSsids;
+        }
+        // Add current network
+        Log.i(TAG, "buildSsidWhitelist: Add SSID: " + currentConnectedNetwork.SSID);
+        whitelistedSsids.add(currentConnectedNetwork.SSID);
+        // Add linked networks
+        for (String configKey : currentConnectedNetwork.linkedConfigurations.keySet()) {
+             Log.i(TAG, "buildSsidWhitelist: Add SSID: "
+                                + configKey.substring(0, configKey.lastIndexOf('"') + 1));
+             whitelistedSsids.add(configKey.substring(0, configKey.lastIndexOf('"') + 1));
+        }
+
+        return whitelistedSsids;
     }
 }

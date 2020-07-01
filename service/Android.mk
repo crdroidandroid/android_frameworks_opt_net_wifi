@@ -43,9 +43,15 @@ LOCAL_STATIC_JAVA_LIBRARIES := \
 	android.hardware.wifi-V1.3-java \
 	android.hardware.wifi.hostapd-V1.0-java \
 	android.hardware.wifi.hostapd-V1.1-java \
+	vendor.qti.hardware.wifi.hostapd-V1.0-java \
+	vendor.qti.hardware.wifi.hostapd-V1.1-java \
 	android.hardware.wifi.supplicant-V1.0-java \
+	vendor.qti.hardware.wifi.supplicant-V2.0-java \
+	vendor.qti.hardware.wifi.supplicant-V2.1-java \
+	vendor.qti.hardware.wifi.supplicant-V2.2-java \
 	android.hardware.wifi.supplicant-V1.1-java \
 	android.hardware.wifi.supplicant-V1.2-java \
+	vendor.qti.hardware.fstman-V1.0-java \
 	wifi_service_proto \
 	ksoap2 \
 	libnanohttpd

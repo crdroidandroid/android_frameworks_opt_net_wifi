@@ -54,7 +54,6 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -1296,8 +1295,10 @@ public class HalDeviceManager {
         @Override
         public void onFailure(WifiStatus status) throws RemoteException {
             mEventHandler.post(() -> {
-                Log.e(TAG, "IWifiEventCallback.onFailure: " + statusString(status));
-                teardownInternal();
+                synchronized (mLock) {
+                    Log.e(TAG, "IWifiEventCallback.onFailure: " + statusString(status));
+                    teardownInternal();
+                }
             });
             // No need to do anything else: listeners may (will) re-start Wi-Fi
         }
@@ -2055,17 +2056,19 @@ public class HalDeviceManager {
     private void dispatchAllDestroyedListeners() {
         if (VDBG) Log.d(TAG, "dispatchAllDestroyedListeners");
 
+        List<InterfaceDestroyedListenerProxy> triggerList = new ArrayList<>();
         synchronized (mLock) {
-            Iterator<Map.Entry<Pair<String, Integer>, InterfaceCacheEntry>> it =
-                    mInterfaceInfoCache.entrySet().iterator();
-            while (it.hasNext()) {
-                InterfaceCacheEntry entry = it.next().getValue();
-                for (InterfaceDestroyedListenerProxy listener : entry.destroyedListeners) {
-                    listener.trigger();
+            for (InterfaceCacheEntry cacheEntry: mInterfaceInfoCache.values()) {
+                for (InterfaceDestroyedListenerProxy listener : cacheEntry.destroyedListeners) {
+                    triggerList.add(listener);
                 }
-                entry.destroyedListeners.clear(); // for insurance (though cache entry is removed)
-                it.remove();
+                cacheEntry.destroyedListeners.clear(); // for insurance
             }
+            mInterfaceInfoCache.clear();
+        }
+
+        for (InterfaceDestroyedListenerProxy listener : triggerList) {
+            listener.trigger();
         }
     }
 

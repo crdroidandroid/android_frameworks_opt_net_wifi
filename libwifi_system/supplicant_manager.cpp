@@ -28,12 +28,15 @@
 #define _REALLY_INCLUDE_SYS__SYSTEM_PROPERTIES_H_
 #include <sys/_system_properties.h>
 
+#include "wifi_fst.h"
+
 namespace android {
 namespace wifi_system {
 namespace {
 
 const char kSupplicantInitProperty[] = "init.svc.wpa_supplicant";
 const char kSupplicantServiceName[] = "wpa_supplicant";
+const char kMigrationServiceName[] = "vendor.move_wifi_data";
 
 }  // namespace
 
@@ -42,6 +45,10 @@ bool SupplicantManager::StartSupplicant() {
   int count = 200; /* wait at most 20 seconds for completion */
   const prop_info* pi;
   unsigned serial = 0;
+
+  if (wifi_start_fstman(0)) {
+    return -1;
+  }
 
   /* Check whether already running */
   if (property_get(kSupplicantInitProperty, supp_status, NULL) &&
@@ -61,6 +68,7 @@ bool SupplicantManager::StartSupplicant() {
     serial = __system_property_serial(pi);
   }
 
+  property_set("ctl.start", kMigrationServiceName);
   property_set("ctl.start", kSupplicantServiceName);
   sched_yield();
 
@@ -78,12 +86,14 @@ bool SupplicantManager::StartSupplicant() {
         if (strcmp(supp_status, "running") == 0) {
           return true;
         } else if (strcmp(supp_status, "stopped") == 0) {
+          wifi_stop_fstman(0);
           return false;
         }
       }
     }
     usleep(100000);
   }
+  wifi_stop_fstman(0);
   return false;
 }
 
@@ -94,19 +104,25 @@ bool SupplicantManager::StopSupplicant() {
   /* Check whether supplicant already stopped */
   if (property_get(kSupplicantInitProperty, supp_status, NULL) &&
       strcmp(supp_status, "stopped") == 0) {
+    wifi_stop_fstman(0);
     return true;
   }
 
+  property_set("ctl.stop", kMigrationServiceName);
   property_set("ctl.stop", kSupplicantServiceName);
   sched_yield();
 
   while (count-- > 0) {
     if (property_get(kSupplicantInitProperty, supp_status, NULL)) {
-      if (strcmp(supp_status, "stopped") == 0) return true;
+      if (strcmp(supp_status, "stopped") == 0) {
+        wifi_stop_fstman(0);
+        return true;
+      }
     }
     usleep(100000);
   }
   LOG(ERROR) << "Failed to stop supplicant";
+  wifi_stop_fstman(0);
   return false;
 }
 

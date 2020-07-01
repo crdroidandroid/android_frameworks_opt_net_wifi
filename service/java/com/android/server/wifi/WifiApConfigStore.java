@@ -16,6 +16,8 @@
 
 package com.android.server.wifi;
 
+import static android.net.wifi.WifiManager.WIFI_GENERATION_DEFAULT;
+
 import android.annotation.NonNull;
 import android.app.Notification;
 import android.app.NotificationManager;
@@ -29,6 +31,7 @@ import android.net.wifi.WifiConfiguration.KeyMgmt;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemProperties;
 import android.text.TextUtils;
 import android.util.Log;
 
@@ -91,6 +94,12 @@ public class WifiApConfigStore {
     private final FrameworkFacade mFrameworkFacade;
     private boolean mRequiresApBandConversion = false;
 
+    // Dual SAP config
+    private String mBridgeInterfaceName = null;
+    private boolean mDualSapStatus = false;
+
+    private int mWifiGeneration = WIFI_GENERATION_DEFAULT;
+
     WifiApConfigStore(Context context, Looper looper,
             BackupManagerProxy backupManagerProxy, FrameworkFacade frameworkFacade) {
         this(context, looper, backupManagerProxy, frameworkFacade, DEFAULT_AP_CONFIG_FILE);
@@ -137,6 +146,9 @@ public class WifiApConfigStore {
         filter.addAction(ACTION_HOTSPOT_CONFIG_USER_TAPPED_CONTENT);
         mContext.registerReceiver(
                 mBroadcastReceiver, filter, null /* broadcastPermission */, mHandler);
+
+        mBridgeInterfaceName = SystemProperties
+                .get("persist.vendor.wifi.softap.bridge.interface", "wifi_br0");
     }
 
     private final BroadcastReceiver mBroadcastReceiver =
@@ -155,6 +167,20 @@ public class WifiApConfigStore {
                     }
                 }
             };
+
+   /* Additional APIs(get/set) to support SAP + SAP Feature */
+
+    public synchronized String getBridgeInterface() {
+        return mBridgeInterfaceName;
+    }
+
+    public synchronized boolean getDualSapStatus() {
+        return mDualSapStatus;
+    }
+
+    public synchronized void setDualSapStatus(boolean enable) {
+        mDualSapStatus = enable;
+    }
 
     /**
      * Return the current soft access point configuration.
@@ -288,7 +314,7 @@ public class WifiApConfigStore {
 
             int authType = in.readInt();
             config.allowedKeyManagement.set(authType);
-            if (authType != KeyMgmt.NONE) {
+            if (authType != KeyMgmt.NONE && authType != KeyMgmt.OWE) {
                 config.preSharedKey = in.readUTF();
             }
         } catch (IOException e) {
@@ -320,7 +346,7 @@ public class WifiApConfigStore {
             out.writeBoolean(config.hiddenSSID);
             int authType = config.getAuthType();
             out.writeInt(authType);
-            if (authType != KeyMgmt.NONE) {
+            if (authType != KeyMgmt.NONE && authType != KeyMgmt.OWE) {
                 out.writeUTF(config.preSharedKey);
             }
         } catch (IOException e) {
@@ -450,13 +476,13 @@ public class WifiApConfigStore {
             return false;
         }
 
-        if (authType == KeyMgmt.NONE) {
+        if (authType == KeyMgmt.NONE || authType == KeyMgmt.OWE) {
             // open networks should not have a password
             if (hasPreSharedKey) {
-                Log.d(TAG, "open softap network should not have a password");
+                Log.d(TAG, "open or OWE softap network should not have a password");
                 return false;
             }
-        } else if (authType == KeyMgmt.WPA2_PSK) {
+        } else if (authType == KeyMgmt.WPA2_PSK || authType == KeyMgmt.SAE) {
             // this is a config that should have a password - check that first
             if (!hasPreSharedKey) {
                 Log.d(TAG, "softap network password must be set");
@@ -469,7 +495,7 @@ public class WifiApConfigStore {
             }
         } else {
             // this is not a supported security type
-            Log.d(TAG, "softap configs must either be open or WPA2 PSK networks");
+            Log.d(TAG, "softap configs must either be open or WPA2 PSK or OWE or SAE networks");
             return false;
         }
 
@@ -499,5 +525,13 @@ public class WifiApConfigStore {
         Intent intent = new Intent(action).setPackage("android");
         return mFrameworkFacade.getBroadcast(
                 mContext, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT);
+    }
+
+    public void setWifiGeneration(int generation) {
+        mWifiGeneration = generation;
+    }
+
+    public int getWifiGeneration() {
+        return mWifiGeneration;
     }
 }

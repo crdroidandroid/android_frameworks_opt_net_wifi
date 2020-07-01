@@ -31,9 +31,19 @@ import static com.android.server.wifi.hotspot2.anqp.Constants.ANQPElementType.HS
 import static com.android.server.wifi.hotspot2.anqp.Constants.ANQPElementType.HSOSUProviders;
 import static com.android.server.wifi.hotspot2.anqp.Constants.ANQPElementType.HSWANMetrics;
 
+import static android.net.wifi.WifiDppConfig.DppResult.DPP_EVENT_AUTH_SUCCESS;
+import static android.net.wifi.WifiDppConfig.DppResult.DPP_EVENT_CONF;
+
 import android.annotation.NonNull;
 import android.content.Context;
 import android.hardware.wifi.supplicant.V1_0.ISupplicant;
+import vendor.qti.hardware.wifi.supplicant.V2_0.ISupplicantVendor;
+import vendor.qti.hardware.wifi.supplicant.V2_0.ISupplicantVendorIface;
+import vendor.qti.hardware.wifi.supplicant.V2_0.ISupplicantVendorStaIface;
+import vendor.qti.hardware.wifi.supplicant.V2_0.ISupplicantVendorNetwork;
+import vendor.qti.hardware.wifi.supplicant.V2_0.ISupplicantVendorStaNetwork;
+import vendor.qti.hardware.wifi.supplicant.V2_0.ISupplicantVendorStaIfaceCallback;
+import vendor.qti.hardware.wifi.supplicant.V2_1.WifiGenerationStatus;
 import android.hardware.wifi.supplicant.V1_0.ISupplicantIface;
 import android.hardware.wifi.supplicant.V1_0.ISupplicantNetwork;
 import android.hardware.wifi.supplicant.V1_0.ISupplicantStaIface;
@@ -54,6 +64,8 @@ import android.net.wifi.WifiManager;
 import android.net.wifi.WifiSsid;
 import android.os.Handler;
 import android.os.HidlSupport.Mutable;
+import android.net.wifi.WifiDppConfig;
+import android.net.wifi.WifiDppConfig.DppResult;
 import android.os.HwRemoteBinder;
 import android.os.Looper;
 import android.os.Process;
@@ -64,6 +76,7 @@ import android.util.MutableBoolean;
 import android.util.MutableInt;
 import android.util.Pair;
 import android.util.SparseArray;
+import android.util.MutableInt;
 
 import com.android.internal.annotations.VisibleForTesting;
 import com.android.server.wifi.WifiNative.DppEventCallback;
@@ -126,11 +139,17 @@ public class SupplicantStaIfaceHal {
     // Supplicant HAL interface objects
     private IServiceManager mIServiceManager = null;
     private ISupplicant mISupplicant;
+    private ISupplicantVendor mISupplicantVendor; // Supplicant Vendor HAL interface objects
     private HashMap<String, ISupplicantStaIface> mISupplicantStaIfaces = new HashMap<>();
+    private HashMap<String, ISupplicantVendorStaIface> mISupplicantVendorStaIfaces = new HashMap<>();
     private HashMap<String, ISupplicantStaIfaceCallback> mISupplicantStaIfaceCallbacks =
+            new HashMap<>();
+    private HashMap<String, ISupplicantVendorStaIfaceCallback> mISupplicantVendorStaIfaceCallbacks =
             new HashMap<>();
     private HashMap<String, SupplicantStaNetworkHal> mCurrentNetworkRemoteHandles = new HashMap<>();
     private HashMap<String, WifiConfiguration> mCurrentNetworkLocalConfigs = new HashMap<>();
+    private HashMap<String, ArrayList<Pair<SupplicantStaNetworkHal, WifiConfiguration>>>
+            mLinkedNetworkLocalAndRemoteConfigs = new HashMap<>();
     private SupplicantDeathEventHandler mDeathEventHandler;
     private ServiceManagerDeathRecipient mServiceManagerDeathRecipient;
     private SupplicantDeathRecipient mSupplicantDeathRecipient;
@@ -183,6 +202,14 @@ public class SupplicantStaIfaceHal {
         }
     }
 
+    private final HwRemoteBinder.DeathRecipient mSupplicantVendorDeathRecipient =
+            cookie -> {
+                synchronized (mLock) {
+                    Log.w(TAG, "ISupplicantVendor/ISupplicantVendorStaIface died: cookie=" + cookie);
+                    supplicantvendorServiceDiedHandler();
+                }
+            };
+
     public SupplicantStaIfaceHal(Context context, WifiMonitor monitor,
                                  PropertyService propertyService, Looper looper) {
         mContext = context;
@@ -234,7 +261,9 @@ public class SupplicantStaIfaceHal {
                 Log.i(TAG, "Registering ISupplicant service ready callback.");
             }
             mISupplicant = null;
+            mISupplicantVendor = null;
             mISupplicantStaIfaces.clear();
+            mISupplicantVendorStaIfaces.clear();
             if (mIServiceManager != null) {
                 // Already have an IServiceManager and serviceNotification registered, don't
                 // don't register another.
@@ -252,7 +281,7 @@ public class SupplicantStaIfaceHal {
                 /* TODO(b/33639391) : Use the new ISupplicant.registerForNotifications() once it
                    exists */
                 if (!mIServiceManager.registerForNotifications(
-                        ISupplicant.kInterfaceName, "", mServiceNotificationCallback)) {
+                        ISupplicant.kInterfaceName, "default", mServiceNotificationCallback)) {
                     Log.e(TAG, "Failed to register for notifications to "
                             + ISupplicant.kInterfaceName);
                     mIServiceManager = null; // Will need to register a new ServiceNotification
@@ -285,6 +314,23 @@ public class SupplicantStaIfaceHal {
         }
     }
 
+    private boolean linkToSupplicantVendorDeath() {
+        synchronized (mLock) {
+            if (mISupplicantVendor == null) return false;
+            try {
+                if (!mISupplicantVendor.linkToDeath(mSupplicantVendorDeathRecipient, 0)) {
+                    Log.wtf(TAG, "Error on linkToDeath on ISupplicantVendor");
+                    supplicantvendorServiceDiedHandler();
+                    return false;
+                }
+            } catch (RemoteException e) {
+                Log.e(TAG, "ISupplicantVendor.linkToDeath exception", e);
+                return false;
+            }
+            return true;
+        }
+    }
+
     private boolean initSupplicantService() {
         synchronized (mLock) {
             try {
@@ -296,6 +342,7 @@ public class SupplicantStaIfaceHal {
                 Log.e(TAG, "ISupplicant.getService exception: " + e);
                 return false;
             }
+
             if (mISupplicant == null) {
                 Log.e(TAG, "Got null ISupplicant service. Stopping supplicant HIDL startup");
                 return false;
@@ -304,7 +351,50 @@ public class SupplicantStaIfaceHal {
                 return false;
             }
         }
+        if (!initSupplicantVendorService())
+            Log.e(TAG, "Failed to init SupplicantVendor service");
         return true;
+    }
+
+    private boolean initSupplicantVendorService() {
+        synchronized (mLock) {
+            try {
+            // Discovering supplicantvendor service
+                mISupplicantVendor = getSupplicantVendorMockable();
+                if (mISupplicantVendor != null) {
+                   Log.e(TAG, "Discover ISupplicantVendor service successfull");
+                }
+            } catch (RemoteException e) {
+                Log.e(TAG, "ISupplicantVendor.getService exception: " + e);
+                return false;
+            }
+            if (mISupplicantVendor == null) {
+                Log.e(TAG, "Got null ISupplicantVendor service. Stopping supplicantVendor HIDL startup");
+                return false;
+            }
+            // check mISupplicantVendor service and trigger death service
+            if (!linkToSupplicantVendorDeath()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean linkToSupplicantVendorStaIfaceDeath(ISupplicantVendorStaIface iface) {
+        synchronized (mLock) {
+            if (iface == null) return false;
+            try {
+                if (!iface.linkToDeath(mSupplicantVendorDeathRecipient, 0)) {
+                    Log.wtf(TAG, "Error on linkToDeath on ISupplicantVendorStaIface");
+                    supplicantvendorServiceDiedHandler();
+                    return false;
+                }
+            } catch (RemoteException e) {
+                Log.e(TAG, "ISupplicantVendorStaIface.linkToDeath exception", e);
+                return false;
+            }
+            return true;
+        }
     }
 
     private int getCurrentNetworkId(@NonNull String ifaceName) {
@@ -324,57 +414,167 @@ public class SupplicantStaIfaceHal {
      * @return true on success, false otherwise.
      */
     public boolean setupIface(@NonNull String ifaceName) {
-        final String methodStr = "setupIface";
-        if (checkSupplicantStaIfaceAndLogFailure(ifaceName, methodStr) != null) return false;
-        ISupplicantIface ifaceHwBinder;
+        synchronized (mLock) {
+            final String methodStr = "setupIface";
+            if (checkSupplicantStaIfaceAndLogFailure(ifaceName, methodStr) != null) return false;
+            if (!checkSupplicantAndLogFailure(methodStr)) return false;
+            ISupplicantIface ifaceHwBinder;
 
-        if (isV1_1()) {
-            ifaceHwBinder = addIfaceV1_1(ifaceName);
-        } else {
-            ifaceHwBinder = getIfaceV1_0(ifaceName);
-        }
-        if (ifaceHwBinder == null) {
-            Log.e(TAG, "setupIface got null iface");
-            return false;
-        }
-        SupplicantStaIfaceHalCallback callback = new SupplicantStaIfaceHalCallback(ifaceName);
-
-        if (isV1_2()) {
-            android.hardware.wifi.supplicant.V1_2.ISupplicantStaIface iface =
-                    getStaIfaceMockableV1_2(ifaceHwBinder);
-
-            SupplicantStaIfaceHalCallbackV1_1 callbackV11 =
-                    new SupplicantStaIfaceHalCallbackV1_1(ifaceName, callback);
-
-            SupplicantStaIfaceHalCallbackV1_2 callbackV12 =
-                    new SupplicantStaIfaceHalCallbackV1_2(callbackV11);
-
-            if (!registerCallbackV1_2(iface, callbackV12)) {
+            if (isV1_1()) {
+                ifaceHwBinder = addIfaceV1_1(ifaceName);
+            } else {
+                ifaceHwBinder = getIfaceV1_0(ifaceName);
+            }
+            if (ifaceHwBinder == null) {
+                Log.e(TAG, "setupIface got null iface");
                 return false;
             }
-            mISupplicantStaIfaces.put(ifaceName, iface);
-            mISupplicantStaIfaceCallbacks.put(ifaceName, callbackV11);
-        } else if (isV1_1()) {
-            android.hardware.wifi.supplicant.V1_1.ISupplicantStaIface iface =
+            SupplicantStaIfaceHalCallback callback = new SupplicantStaIfaceHalCallback(ifaceName);
+
+            if (isV1_2()) {
+                android.hardware.wifi.supplicant.V1_2.ISupplicantStaIface iface =
+                        getStaIfaceMockableV1_2(ifaceHwBinder);
+
+                SupplicantStaIfaceHalCallbackV1_1 callbackV11 =
+                        new SupplicantStaIfaceHalCallbackV1_1(ifaceName, callback);
+
+                SupplicantStaIfaceHalCallbackV1_2 callbackV12 =
+                        new SupplicantStaIfaceHalCallbackV1_2(callbackV11);
+
+                if (!registerCallbackV1_2(iface, callbackV12)) {
+                    return false;
+                }
+                mISupplicantStaIfaces.put(ifaceName, iface);
+                mISupplicantStaIfaceCallbacks.put(ifaceName, callbackV11);
+            } else if (isV1_1()) {
+                android.hardware.wifi.supplicant.V1_1.ISupplicantStaIface iface =
                     getStaIfaceMockableV1_1(ifaceHwBinder);
             SupplicantStaIfaceHalCallbackV1_1 callbackV1_1 =
                     new SupplicantStaIfaceHalCallbackV1_1(ifaceName, callback);
 
-            if (!registerCallbackV1_1(iface, callbackV1_1)) {
-                return false;
-            }
-            mISupplicantStaIfaces.put(ifaceName, iface);
-            mISupplicantStaIfaceCallbacks.put(ifaceName, callbackV1_1);
-        } else {
-            ISupplicantStaIface iface = getStaIfaceMockable(ifaceHwBinder);
+                if (!registerCallbackV1_1(iface, callbackV1_1)) {
+                    return false;
+                }
+                mISupplicantStaIfaces.put(ifaceName, iface);
+                mISupplicantStaIfaceCallbacks.put(ifaceName, callbackV1_1);
+            } else {
+                ISupplicantStaIface iface = getStaIfaceMockable(ifaceHwBinder);
 
-            if (!registerCallback(iface, callback)) {
-                return false;
+                if (!registerCallback(iface, callback)) {
+                    return false;
+                }
+                mISupplicantStaIfaces.put(ifaceName, iface);
+                mISupplicantStaIfaceCallbacks.put(ifaceName, callback);
             }
-            mISupplicantStaIfaces.put(ifaceName, iface);
-            mISupplicantStaIfaceCallbacks.put(ifaceName, callback);
+            /** creation vendor sta iface binder */
+            if (!vendor_setupIface(ifaceName, callback))
+                Log.e(TAG, "Failed to create vendor setupiface");
+
+            return true;
+        }
+    }
+
+    /**
+     * Setup a Vendor STA interface for the specified iface name.
+     *
+     * @param ifaceName Name of the interface.
+     * @return true on success, false otherwise.
+     */
+    public boolean vendor_setupIface(@NonNull String ifaceName, SupplicantStaIfaceHalCallback callback) {
+        final String methodStr = "vendor_setupIface";
+        if (checkSupplicantVendorStaIfaceAndLogFailure(ifaceName, methodStr) != null) {
+            Log.e(TAG, "Already created vendor setupinterface");
+            return true;
+        }
+        ISupplicantVendorIface Vendor_ifaceHwBinder = null;
+
+        if (isVendor_2_0()) {
+            Log.e(TAG, "Try to get Vendor HIDL@2.0 interface");
+            Vendor_ifaceHwBinder = getVendorIfaceV2_0(ifaceName);
+        }
+        if (Vendor_ifaceHwBinder == null) {
+            Log.e(TAG, "Failed to get vendor iface binder");
+            return false;
+        }
+
+        ISupplicantVendorStaIface vendor_iface = getVendorStaIfaceMockable(Vendor_ifaceHwBinder);
+        if (vendor_iface == null) {
+            Log.e(TAG, "Failed to get ISupplicantVendorStaIface proxy");
+            return false;
+        }
+        else
+            Log.e(TAG, "Successful get Vendor sta interface");
+
+        if (!linkToSupplicantVendorStaIfaceDeath(vendor_iface)) {
+            return false;
+        }
+
+        if (vendor_iface != null) {
+            ISupplicantVendorStaIfaceCallback vendorcallback =
+                    new SupplicantVendorStaIfaceHalCallback(ifaceName, callback);
+            if (!registerVendorCallback(vendor_iface, vendorcallback)) {
+                Log.e(TAG, "Failed to register Vendor callback");
+            } else {
+                mISupplicantVendorStaIfaces.put(ifaceName, vendor_iface);
+                if (vendorcallback != null)
+                    mISupplicantVendorStaIfaceCallbacks.put(ifaceName, vendorcallback);
+            }
         }
         return true;
+    }
+
+    /**
+     * Get a Vendor STA interface for the specified iface name.
+     *
+     * @param ifaceName Name of the interface.
+     * @return true on success, false otherwise.
+     */
+    private ISupplicantVendorIface getVendorIfaceV2_0(@NonNull String ifaceName) {
+        synchronized (mLock) {
+            /** List all supplicant Ifaces */
+            final ArrayList<ISupplicant.IfaceInfo> supplicantIfaces = new ArrayList<>();
+            try {
+                final String methodStr = "listVendorInterfaces";
+                if (!checkSupplicantVendorAndLogFailure(methodStr)) return null;
+                mISupplicantVendor.listVendorInterfaces((SupplicantStatus status,
+                                             ArrayList<ISupplicant.IfaceInfo> ifaces) -> {
+                    if (!checkSupplicantVendorStatusAndLogFailure(status, methodStr)) {
+                        return;
+                    }
+                    supplicantIfaces.addAll(ifaces);
+                });
+            } catch (RemoteException e) {
+                Log.e(TAG, "ISupplicantVendor.listInterfaces exception: " + e);
+                supplicantvendorServiceDiedHandler();
+                return null;
+            }
+            if (supplicantIfaces.size() == 0) {
+                Log.e(TAG, "Got zero HIDL supplicant vendor ifaces. Stopping supplicant vendor HIDL startup.");
+                return null;
+            }
+            Mutable<ISupplicantVendorIface> supplicantVendorIface = new Mutable<>();
+            for (ISupplicant.IfaceInfo ifaceInfo : supplicantIfaces) {
+                if (ifaceInfo.type == IfaceType.STA && ifaceName.equals(ifaceInfo.name)) {
+                    try {
+                        final String methodStr = "getVendorInterface";
+                        if (!checkSupplicantVendorAndLogFailure(methodStr)) return null;
+                        mISupplicantVendor.getVendorInterface(ifaceInfo,
+                                (SupplicantStatus status, ISupplicantVendorIface iface) -> {
+                                    if (!checkSupplicantVendorStatusAndLogFailure(status, methodStr)) {
+                                        return;
+                                    }
+                                    supplicantVendorIface.value = iface;
+                                });
+                    } catch (RemoteException e) {
+                        Log.e(TAG, "ISupplicantVendor.getInterface exception: " + e);
+                        supplicantvendorServiceDiedHandler();
+                        return null;
+                    }
+                    break;
+                }
+            }
+            return supplicantVendorIface.value;
+        }
     }
 
     /**
@@ -385,12 +585,14 @@ public class SupplicantStaIfaceHal {
      */
     private ISupplicantIface getIfaceV1_0(@NonNull String ifaceName) {
         synchronized (mLock) {
+            final String methodStr = "getIfaceV1_0";
             if (mISupplicant == null) {
                 return null;
             }
 
             /** List all supplicant Ifaces */
             final ArrayList<ISupplicant.IfaceInfo> supplicantIfaces = new ArrayList<>();
+            if (!checkSupplicantAndLogFailure(methodStr)) return null;
             try {
                 mISupplicant.listInterfaces((SupplicantStatus status,
                                              ArrayList<ISupplicant.IfaceInfo> ifaces) -> {
@@ -446,7 +648,12 @@ public class SupplicantStaIfaceHal {
             ifaceInfo.type = IfaceType.STA;
             Mutable<ISupplicantIface> supplicantIface = new Mutable<>();
             try {
-                getSupplicantMockableV1_1().addInterface(ifaceInfo,
+                android.hardware.wifi.supplicant.V1_1.ISupplicant ISupplicantV1_1 = getSupplicantMockableV1_1();
+                if(ISupplicantV1_1 == null) {
+                    Log.e(TAG, "Cannot add network, ISupplicant is null");
+                    return null;
+                }
+                ISupplicantV1_1.addInterface(ifaceInfo,
                         (SupplicantStatus status, ISupplicantIface iface) -> {
                             if (status.code != SupplicantStatusCode.SUCCESS
                                     && status.code != SupplicantStatusCode.FAILURE_IFACE_EXISTS) {
@@ -488,7 +695,12 @@ public class SupplicantStaIfaceHal {
                 Log.e(TAG, "Trying to teardown unknown inteface");
                 return false;
             }
+            if (mISupplicantVendorStaIfaces.remove(ifaceName) == null) {
+                Log.e(TAG, "Trying to teardown unknown vendor interface");
+                return false;
+            }
             mISupplicantStaIfaceCallbacks.remove(ifaceName);
+            mISupplicantVendorStaIfaceCallbacks.remove(ifaceName);
             return true;
         }
     }
@@ -505,7 +717,12 @@ public class SupplicantStaIfaceHal {
                 ISupplicant.IfaceInfo ifaceInfo = new ISupplicant.IfaceInfo();
                 ifaceInfo.name = ifaceName;
                 ifaceInfo.type = IfaceType.STA;
-                SupplicantStatus status = getSupplicantMockableV1_1().removeInterface(ifaceInfo);
+                android.hardware.wifi.supplicant.V1_1.ISupplicant ISupplicantV1_1 = getSupplicantMockableV1_1();
+                if(ISupplicantV1_1 == null) {
+                    Log.e(TAG, "Failed to remove iface, ISupplicant is null");
+                    return false;
+		}
+                SupplicantStatus status = ISupplicantV1_1.removeInterface(ifaceInfo);
                 if (status.code != SupplicantStatusCode.SUCCESS) {
                     Log.e(TAG, "Failed to remove iface " + status.code);
                     return false;
@@ -528,11 +745,13 @@ public class SupplicantStaIfaceHal {
      * @return Returns true on success.
      */
     public boolean registerDeathHandler(@NonNull SupplicantDeathEventHandler handler) {
-        if (mDeathEventHandler != null) {
-            Log.e(TAG, "Death handler already present");
+        synchronized (mLock) {
+            if (mDeathEventHandler != null) {
+                Log.e(TAG, "Death handler already present");
+            }
+            mDeathEventHandler = handler;
+            return true;
         }
-        mDeathEventHandler = handler;
-        return true;
     }
 
     /**
@@ -540,20 +759,32 @@ public class SupplicantStaIfaceHal {
      * @return Returns true on success.
      */
     public boolean deregisterDeathHandler() {
-        if (mDeathEventHandler == null) {
-            Log.e(TAG, "No Death handler present");
+        synchronized (mLock) {
+            if (mDeathEventHandler == null) {
+                Log.e(TAG, "No Death handler present");
+            }
+            mDeathEventHandler = null;
+            return true;
         }
-        mDeathEventHandler = null;
-        return true;
     }
 
 
     private void clearState() {
         synchronized (mLock) {
             mISupplicant = null;
+            mISupplicantVendor = null;
             mISupplicantStaIfaces.clear();
+            mISupplicantVendorStaIfaces.clear();
             mCurrentNetworkLocalConfigs.clear();
             mCurrentNetworkRemoteHandles.clear();
+            mLinkedNetworkLocalAndRemoteConfigs.clear();
+        }
+    }
+
+    private void supplicantvendorServiceDiedHandler() {
+        synchronized (mLock) {
+            mISupplicantVendor = null;
+            mISupplicantVendorStaIfaces.clear();
         }
     }
 
@@ -641,7 +872,11 @@ public class SupplicantStaIfaceHal {
             final String methodStr = "terminate";
             if (!checkSupplicantAndLogFailure(methodStr)) return;
             try {
-                getSupplicantMockableV1_1().terminate();
+                android.hardware.wifi.supplicant.V1_1.ISupplicant ISupplicantV1_1 = getSupplicantMockableV1_1();
+                if(ISupplicantV1_1 != null)
+                    ISupplicantV1_1.terminate();
+                else
+                    Log.e(TAG, "Cannot terminate ISupplicant. ISupplicant is Null.");
             } catch (RemoteException e) {
                 handleRemoteException(e, methodStr);
             } catch (NoSuchElementException e) {
@@ -698,6 +933,17 @@ public class SupplicantStaIfaceHal {
         }
     }
 
+    protected ISupplicantVendor getSupplicantVendorMockable() throws RemoteException {
+        synchronized (mLock) {
+            try {
+                return ISupplicantVendor.getService();
+            } catch (NoSuchElementException e) {
+                Log.e(TAG, "Failed to get ISupplicant", e);
+                return null;
+            }
+        }
+    }
+
     protected android.hardware.wifi.supplicant.V1_1.ISupplicant getSupplicantMockableV1_1()
             throws RemoteException, NoSuchElementException {
         synchronized (mLock) {
@@ -725,6 +971,18 @@ public class SupplicantStaIfaceHal {
         synchronized (mLock) {
             return android.hardware.wifi.supplicant.V1_1.ISupplicantStaIface
                     .asInterface(iface.asBinder());
+        }
+    }
+
+    protected ISupplicantVendorStaIface getVendorStaIfaceMockable(ISupplicantVendorIface iface) {
+        synchronized (mLock) {
+            return ISupplicantVendorStaIface.asInterface(iface.asBinder());
+        }
+    }
+
+    protected ISupplicantVendorStaNetwork getVendorStaNetworkMockable(ISupplicantVendorNetwork network) {
+        synchronized (mLock) {
+            return ISupplicantVendorStaNetwork.asInterface(network.asBinder());
         }
     }
 
@@ -779,13 +1037,37 @@ public class SupplicantStaIfaceHal {
     }
 
     /**
-     * Helper method to look up the network object for the specified iface.
+     * Check if the device is running V2_0 supplicant vendor service.
+     * @return
+     */
+    private boolean isVendor_2_0() {
+        synchronized (mLock) {
+            try {
+                return (getSupplicantVendorMockable() != null);
+            } catch (RemoteException e) {
+                Log.e(TAG, "ISupplicantVendor.getService exception: " + e);
+                supplicantServiceDiedHandler(mDeathRecipientCookie);
+                return false;
+            }
+        }
+    }
+
+    /**
+     * Helper method to look up the iface object for the specified iface.
      */
     private ISupplicantStaIface getStaIface(@NonNull String ifaceName) {
         return mISupplicantStaIfaces.get(ifaceName);
     }
 
     /**
+     * Helper method to look up the vendor_iface object for the specified iface.
+     */
+    private ISupplicantVendorStaIface getVendorStaIface(@NonNull String ifaceName) {
+        return mISupplicantVendorStaIfaces.get(ifaceName);
+    }
+
+    /**
+
      * Helper method to look up the network object for the specified iface.
      */
     private SupplicantStaNetworkHal getCurrentNetworkRemoteHandle(@NonNull String ifaceName) {
@@ -819,6 +1101,9 @@ public class SupplicantStaIfaceHal {
                 loge("Failed to add a network!");
                 return null;
             }
+            network.getId();
+            network.setVendorStaNetwork(getVendorNetwork
+                                        (ifaceName, network.getNetworkId()));
             boolean saveSuccess = false;
             try {
                 saveSuccess = network.saveWifiConfiguration(config);
@@ -849,9 +1134,10 @@ public class SupplicantStaIfaceHal {
      */
     public boolean connectToNetwork(@NonNull String ifaceName, @NonNull WifiConfiguration config) {
         synchronized (mLock) {
-            logd("connectToNetwork " + config.configKey());
+            boolean isAscii = WifiGbk.isAllAscii(WifiGbk.getSsidBytes(config.SSID, "UTF-8")); // wifigbk++
+            logd("connectToNetwork " + config.configKey() + " isAscii=" + isAscii);
             WifiConfiguration currentConfig = getCurrentNetworkLocalConfig(ifaceName);
-            if (WifiConfigurationUtil.isSameNetwork(config, currentConfig)) {
+            if (WifiConfigurationUtil.isSameNetwork(config, currentConfig) && isAscii) {
                 String networkSelectionBSSID = config.getNetworkSelectionStatus()
                         .getNetworkSelectionBSSID();
                 String networkSelectionBSSIDCurrent =
@@ -871,10 +1157,21 @@ public class SupplicantStaIfaceHal {
             } else {
                 mCurrentNetworkRemoteHandles.remove(ifaceName);
                 mCurrentNetworkLocalConfigs.remove(ifaceName);
+                mLinkedNetworkLocalAndRemoteConfigs.remove(ifaceName);
                 if (!removeAllNetworks(ifaceName)) {
                     loge("Failed to remove existing networks");
                     return false;
                 }
+               /**
+                * Handle connection to saved FILS network when wifi is
+                * restarted with altered driver configuration.
+                */
+                if (!getCapabilities(ifaceName, "key_mgmt").contains("FILS-SHA256"))
+                    config.allowedKeyManagement.clear(WifiConfiguration.KeyMgmt.FILS_SHA256);
+
+                if (!getCapabilities(ifaceName, "key_mgmt").contains("FILS-SHA384"))
+                    config.allowedKeyManagement.clear(WifiConfiguration.KeyMgmt.FILS_SHA384);
+
                 Pair<SupplicantStaNetworkHal, WifiConfiguration> pair =
                         addNetworkAndSaveConfig(ifaceName, config);
                 if (pair == null) {
@@ -884,6 +1181,7 @@ public class SupplicantStaIfaceHal {
                 mCurrentNetworkRemoteHandles.put(ifaceName, pair.first);
                 mCurrentNetworkLocalConfigs.put(ifaceName, pair.second);
             }
+            getCapabilities(ifaceName, "key_mgmt");
             SupplicantStaNetworkHal networkHandle =
                     checkSupplicantStaNetworkAndLogFailure(ifaceName, "connectToNetwork");
             if (networkHandle == null || !networkHandle.select()) {
@@ -1024,6 +1322,7 @@ public class SupplicantStaIfaceHal {
             // current network on receiving disconnection event from supplicant (b/32898136).
             mCurrentNetworkRemoteHandles.remove(ifaceName);
             mCurrentNetworkLocalConfigs.remove(ifaceName);
+            mLinkedNetworkLocalAndRemoteConfigs.remove(ifaceName);
             return true;
         }
     }
@@ -1282,6 +1581,33 @@ public class SupplicantStaIfaceHal {
         }
     }
 
+    /**
+     * @return The ISupplicantVendorStaNetwork object for the given SupplicantNetworkId int, returns null if
+     * the call fails
+     */
+    private ISupplicantVendorStaNetwork getVendorNetwork(@NonNull String ifaceName, int id) {
+        synchronized (mLock) {
+            final String methodStr = "getVendorNetwork";
+            ISupplicantVendorStaIface iface = checkSupplicantVendorStaIfaceAndLogFailure(ifaceName, methodStr);
+            if (iface == null) return null;
+            Mutable<ISupplicantVendorNetwork> gotNetwork = new Mutable<>();
+            try {
+                iface.getVendorNetwork(id, (SupplicantStatus status, ISupplicantVendorNetwork network) -> {
+                    if (checkStatusAndLogFailure(status, methodStr)) {
+                        gotNetwork.value = network;
+                    }
+                });
+            } catch (RemoteException e) {
+                handleRemoteException(e, methodStr);
+            }
+            if (gotNetwork.value != null) {
+                return getVendorStaNetworkMockable(gotNetwork.value);
+            } else {
+                return null;
+            }
+        }
+    }
+
     /** See ISupplicantStaNetwork.hal for documentation */
     private boolean registerCallback(
             ISupplicantStaIface iface, ISupplicantStaIfaceCallback callback) {
@@ -1325,6 +1651,22 @@ public class SupplicantStaIfaceHal {
             try {
                 SupplicantStatus status =  iface.registerCallback_1_2(callback);
                 return checkStatusAndLogFailure(status, methodStr);
+            } catch (RemoteException e) {
+                handleRemoteException(e, methodStr);
+                return false;
+            }
+        }
+    }
+
+    /** See ISupplicantVendorStaIface.hal for documentation */
+    private boolean registerVendorCallback(
+            ISupplicantVendorStaIface iface, ISupplicantVendorStaIfaceCallback callback) {
+        synchronized (mLock) {
+            final String methodStr = "registerVendorCallback";
+            if (iface == null) return false;
+            try {
+                SupplicantStatus status =  iface.registerVendorCallback(callback);
+                return checkVendorStatusAndLogFailure(status, methodStr);
             } catch (RemoteException e) {
                 handleRemoteException(e, methodStr);
                 return false;
@@ -2050,6 +2392,36 @@ public class SupplicantStaIfaceHal {
     }
 
     /**
+     * Querry driver capabilities
+     *
+     * @param ifaceName Name of the interface.
+     * @param capaType ASCII string, capability type ex: key_mgmt
+     * @return String of capabilities fetched from driver
+     */
+    public String getCapabilities(@NonNull String ifaceName, String capaType) {
+        synchronized (mLock) {
+            final String methodStr = "getCapabilities";
+            final Mutable<String> capability = new Mutable<>();
+
+            capability.value = "";
+            ISupplicantVendorStaIface iface =
+               checkSupplicantVendorStaIfaceAndLogFailure(ifaceName, methodStr);
+            if (iface == null) return capability.value;
+            try {
+                 iface.getCapabilities(capaType,
+                        (SupplicantStatus status, String capaVal) -> {
+                         if(checkVendorStatusAndLogFailure(status, methodStr)) {
+                       capability.value = capaVal;
+                    }
+                });
+            } catch (RemoteException e) {
+                handleRemoteException(e, methodStr);
+            }
+            return capability.value;
+         }
+    }
+
+    /**
      * Set country code.
      *
      * @param ifaceName Name of the interface.
@@ -2080,6 +2452,55 @@ public class SupplicantStaIfaceHal {
             }
         }
     }
+
+    /**
+     * Flush all previously configured HLPs.
+     *
+     * @param ifaceName Name of the interface.
+     * @return true if request is sent successfully, false otherwise.
+     */
+    public boolean flushAllHlp(@NonNull String ifaceName) {
+        synchronized (mLock) {
+            final String methodStr = "filsHlpFlushRequest";
+            ISupplicantVendorStaIface iface =
+                checkSupplicantVendorStaIfaceAndLogFailure(ifaceName, methodStr);
+            if (iface == null) return false;
+            try {
+                SupplicantStatus status = iface.filsHlpFlushRequest();
+                return checkVendorStatusAndLogFailure(status, methodStr);
+            } catch (RemoteException e) {
+                handleRemoteException(e, methodStr);
+                return false;
+            }
+        }
+    }
+
+    /**
+     * Set FILS HLP packet.
+     *
+     * @param ifaceName Name of the interface.
+     * @param dst Destination MAC address.
+     * @param hlpPacket Hlp Packet data in hex.
+     * @return true if request is sent successfully, false otherwise.
+     */
+    public boolean addHlpReq(@NonNull String ifaceName, String dst, String hlpPacket) {
+        synchronized (mLock) {
+            final String methodStr = "filsHlpAddRequest";
+            ISupplicantVendorStaIface iface =
+                   checkSupplicantVendorStaIfaceAndLogFailure(ifaceName, methodStr);
+            if (iface == null) return false;
+            try {
+                SupplicantStatus status = iface.filsHlpAddRequest(
+                                               NativeUtil.macAddressToByteArray(dst),
+                                               NativeUtil.hexOrQuotedStringToBytes(hlpPacket));
+                return checkVendorStatusAndLogFailure(status, methodStr);
+            } catch (RemoteException e) {
+                handleRemoteException(e, methodStr);
+                return false;
+            }
+        }
+    }
+
 
     /**
      * Start WPS pin registrar operation with the specified peer and pin.
@@ -2350,6 +2771,19 @@ public class SupplicantStaIfaceHal {
     }
 
     /**
+     * Returns false if SupplicantVendor is null, and logs failure to call methodStr
+     */
+    private boolean checkSupplicantVendorAndLogFailure(final String methodStr) {
+        synchronized (mLock) {
+            if (mISupplicantVendor == null) {
+                Log.e(TAG, "Can't call " + methodStr + ", ISupplicantVendor is null");
+                return false;
+            }
+            return true;
+        }
+    }
+
+    /**
      * Returns false if SupplicantStaIface is null, and logs failure to call methodStr
      */
     private ISupplicantStaIface checkSupplicantStaIfaceAndLogFailure(
@@ -2358,6 +2792,21 @@ public class SupplicantStaIfaceHal {
             ISupplicantStaIface iface = getStaIface(ifaceName);
             if (iface == null) {
                 Log.e(TAG, "Can't call " + methodStr + ", ISupplicantStaIface is null");
+                return null;
+            }
+            return iface;
+        }
+    }
+
+    /**
+     * Returns false if SupplicantVendorStaIface is null, and logs failure to call methodStr
+     */
+    private ISupplicantVendorStaIface checkSupplicantVendorStaIfaceAndLogFailure(
+            @NonNull String ifaceName, final String methodStr) {
+        synchronized (mLock) {
+            ISupplicantVendorStaIface iface = getVendorStaIface(ifaceName);
+            if (iface == null) {
+                Log.e(TAG, "Can't call " + methodStr + ", ISupplicantVendorStaIface is null");
                 return null;
             }
             return iface;
@@ -2392,6 +2841,44 @@ public class SupplicantStaIfaceHal {
             } else {
                 if (mVerboseLoggingEnabled) {
                     Log.d(TAG, "ISupplicantStaIface." + methodStr + " succeeded");
+                }
+                return true;
+            }
+        }
+    }
+
+    /**
+     * Returns true if provided supplicant vendor status code is SUCCESS, logs debug message and returns false
+     * otherwise
+     */
+    private boolean checkSupplicantVendorStatusAndLogFailure(SupplicantStatus status,
+            final String methodStr) {
+        synchronized (mLock) {
+            if (status.code != SupplicantStatusCode.SUCCESS) {
+                Log.e(TAG, "ISupplicantVendor." + methodStr + " failed: " + status);
+                return false;
+            } else {
+                if (mVerboseLoggingEnabled) {
+                    Log.d(TAG, "ISupplicantVendor." + methodStr + " succeeded");
+                }
+                return true;
+            }
+        }
+    }
+
+    /**
+     * Returns true if provided Vendor status code is SUCCESS, logs debug message and returns false
+     * otherwise
+     */
+    private boolean checkVendorStatusAndLogFailure(SupplicantStatus status,
+            final String methodStr) {
+        synchronized (mLock) {
+            if (status.code != SupplicantStatusCode.SUCCESS) {
+                Log.e(TAG, "ISupplicantVendorStaIface." + methodStr + " failed: " + status);
+                return false;
+            } else {
+                if (mVerboseLoggingEnabled) {
+                    Log.d(TAG, "ISupplicantVendorStaIface." + methodStr + " succeeded");
                 }
                 return true;
             }
@@ -2492,6 +2979,103 @@ public class SupplicantStaIfaceHal {
         }
     }
 
+    private class SupplicantVendorStaIfaceHalCallback extends ISupplicantVendorStaIfaceCallback.Stub {
+        private String mIfaceName;
+        private SupplicantStaIfaceHalCallback mSupplicantStaIfacecallback;
+
+        SupplicantVendorStaIfaceHalCallback(@NonNull String ifaceName, SupplicantStaIfaceHalCallback callback) {
+            mIfaceName = ifaceName;
+            mSupplicantStaIfacecallback = callback;
+        }
+
+        @Override
+        public void onVendorStateChanged(int newState, byte[/* 6 */] bssid, int id,
+                                   ArrayList<Byte> ssid, boolean filsHlpSent) {
+            synchronized (mLock) {
+                logCallback("onVendorStateChanged");
+                SupplicantState newSupplicantState = supplicantHidlStateToFrameworkState(newState);
+                WifiSsid wifiSsid = // wifigbk++
+                        WifiGbk.createWifiSsidFromByteArray(NativeUtil.byteArrayFromArrayList(ssid));
+                String bssidStr = NativeUtil.macAddressFromByteArray(bssid);
+                mSupplicantStaIfacecallback.updateStateIsFourway(
+                        (newState == ISupplicantStaIfaceCallback.State.FOURWAY_HANDSHAKE));
+                SupplicantStaNetworkHal networkHal = getCurrentNetworkRemoteHandle(mIfaceName);
+                if (networkHal != null && id != networkHal.getNetworkId()) {
+                    Log.i(TAG, "onVendorStateChanged: network id changed, newState = " + newState
+                                + ", SSID = " + wifiSsid + ", bssid = " + bssidStr
+                                + ", networkId = " + id);
+                    ArrayList<Pair<SupplicantStaNetworkHal, WifiConfiguration>> linkedNetworkHandles =
+                        mLinkedNetworkLocalAndRemoteConfigs.get(mIfaceName);
+
+                    for (Pair<SupplicantStaNetworkHal, WifiConfiguration> pair : linkedNetworkHandles) {
+                        if (pair.first.getNetworkId() != id) continue;
+
+                        Log.i(TAG, "onVendorStateChanged: make linked network as current network");
+                        mCurrentNetworkRemoteHandles.put(mIfaceName, pair.first);
+                        mCurrentNetworkLocalConfigs.put(mIfaceName, pair.second);
+                    }
+                }
+                if (newSupplicantState == SupplicantState.COMPLETED) {
+                    if (filsHlpSent == false) {
+                        mWifiMonitor.broadcastNetworkConnectionEvent(
+                                mIfaceName, getCurrentNetworkId(mIfaceName), bssidStr);
+                    } else {
+                        mWifiMonitor.broadcastFilsNetworkConnectionEvent(
+                                mIfaceName, getCurrentNetworkId(mIfaceName), bssidStr);
+                    }
+                }
+                mWifiMonitor.broadcastSupplicantStateChangeEvent(
+                        mIfaceName, getCurrentNetworkId(mIfaceName), wifiSsid, bssidStr, newSupplicantState);
+            }
+        }
+
+        /* DPP Callbacks Start */
+        @Override
+        public void onDppAuthSuccess(boolean initiator) {
+            logCallback("onDppAuthSuccess");
+            synchronized (mLock) {
+                DppResult result = new DppResult();
+                result.initiator = initiator;
+                mWifiMonitor.broadcastDppEvent(mIfaceName, DPP_EVENT_AUTH_SUCCESS, result);
+            }
+        }
+
+        @Override
+        public void onDppConf(byte type, ArrayList<Byte> ssid, String connector,
+                              ArrayList<Byte> cSignKey, ArrayList<Byte> netAccessKey,
+                              int netAccessExpiry, String passphrase, ArrayList<Byte> psk) {
+            logCallback("onDppConf");
+            synchronized (mLock) {
+                DppResult result = new DppResult();
+                result.configEventType = type;
+                result.ssid = NativeUtil.stringFromByteArrayList(ssid);
+                result.connector = connector;
+                result.cSignKey = NativeUtil.bytesToHexOrQuotedString(cSignKey);
+                result.netAccessKey = NativeUtil.bytesToHexOrQuotedString(netAccessKey);
+                result.netAccessKeyExpiry = netAccessExpiry;
+                result.passphrase = passphrase;
+                result.psk = NativeUtil.stringFromByteArrayList(psk);
+                mWifiMonitor.broadcastDppEvent(mIfaceName, DPP_EVENT_CONF, result);
+            }
+        }
+
+        @Override
+        public void onDppNotCompatible(byte capab, boolean initiator) {}
+
+        @Override
+        public void onDppResponsePending() {}
+
+        @Override
+        public void onDppScanPeerQrCode(ArrayList<Byte> bootstrapData) {}
+
+        @Override
+        public void onDppMissingAuth(byte dppAuthParam) {}
+
+        @Override
+        public void onDppNetworkId(int netID) {}
+        /* DPP Callbacks ends */
+    }
+
     private class SupplicantStaIfaceHalCallback extends ISupplicantStaIfaceCallback.Stub {
         private String mIfaceName;
         private boolean mStateIsFourway = false; // Used to help check for PSK password mismatch
@@ -2564,8 +3148,8 @@ public class SupplicantStaIfaceHal {
             synchronized (mLock) {
                 logCallback("onStateChanged");
                 SupplicantState newSupplicantState = supplicantHidlStateToFrameworkState(newState);
-                WifiSsid wifiSsid =
-                        WifiSsid.createFromByteArray(NativeUtil.byteArrayFromArrayList(ssid));
+                WifiSsid wifiSsid = // wifigbk++
+                        WifiGbk.createWifiSsidFromByteArray(NativeUtil.byteArrayFromArrayList(ssid));
                 String bssidStr = NativeUtil.macAddressFromByteArray(bssid);
                 mStateIsFourway = (newState == ISupplicantStaIfaceCallback.State.FOURWAY_HANDSHAKE);
                 if (newSupplicantState == SupplicantState.COMPLETED) {
@@ -2676,6 +3260,17 @@ public class SupplicantStaIfaceHal {
                                 mIfaceName, WifiManager.ERROR_AUTH_FAILURE_WRONG_PSWD, -1);
                     }
                 }
+
+                // For WEP password error: not check status code to avoid IoT issues with AP.
+                WifiConfiguration wificonfig = getCurrentNetworkLocalConfig(mIfaceName);
+                if (wificonfig != null && WifiConfigurationUtil.isConfigForWepNetwork(wificonfig)) {
+                    logCallback("WEP incorrect password");
+                    mWifiMonitor.broadcastAuthenticationFailureEvent(
+                        mIfaceName, WifiManager.ERROR_AUTH_FAILURE_WRONG_PSWD, -1);
+                    // Not broadcast ASSOC REJECT to avoid bssid get blacklisted.
+                    return;
+                }
+
                 mWifiMonitor.broadcastAssociationRejectionEvent(mIfaceName, statusCode, timedOut,
                         NativeUtil.macAddressFromByteArray(bssid));
             }
@@ -2755,6 +3350,14 @@ public class SupplicantStaIfaceHal {
                 logCallback("onExtRadioWorkTimeout");
             }
         }
+
+        public void updateStateIsFourway(boolean stateIsFourway) {
+            synchronized (mLock) {
+                logCallback("updateStateIsFourway");
+                mStateIsFourway = stateIsFourway;
+            }
+        }
+
     }
 
     private class SupplicantStaIfaceHalCallbackV1_1 extends
@@ -3167,6 +3770,317 @@ public class SupplicantStaIfaceHal {
     }
 
     /**
+     * Add the DPP bootstrap info obtained from QR code.
+     *
+     * @param ifaceName Name of the interface.
+     * @param uri:The URI obtained from the QR code.
+     *
+     * @return: Handle to strored info else -1 on failure
+     */
+    public int dppAddBootstrapQrCode(@NonNull String ifaceName, String uri) {
+        if (TextUtils.isEmpty(uri)) return -1;
+        synchronized (mLock) {
+            final String methodStr = "dppAddBootstrapQrCode";
+            final MutableInt handle = new MutableInt(-1);
+            ISupplicantVendorStaIface iface =
+                   checkSupplicantVendorStaIfaceAndLogFailure(ifaceName, methodStr);
+            if (iface == null) return -1;
+            try {
+                iface.dppAddBootstrapQrcode(uri,
+                        (SupplicantStatus status, int hdl) -> {
+                            if (checkVendorStatusAndLogFailure(status, methodStr)) {
+                                handle.value = hdl;
+                            }
+                        });
+            } catch (RemoteException e) {
+                handleRemoteException(e, methodStr);
+            }
+            return handle.value;
+        }
+    }
+
+    /**
+     * Generate bootstrap URI based on the passed arguments
+     *
+     * @param ifaceName Name of the interface.
+     * @param config – bootstrap generate config
+     *
+     * @return: Handle to strored URI info else -1 on failure
+     */
+    public int dppBootstrapGenerate(@NonNull String ifaceName, WifiDppConfig config) {
+        synchronized (mLock) {
+            final String methodStr = "dppBootstrapGenerate";
+            final MutableInt handle = new MutableInt(-1);
+
+            String chan_list = (TextUtils.isEmpty(config.chan_list)) ? "" : config.chan_list;
+            String mac_addr = (TextUtils.isEmpty(config.mac_addr)) ? "00:00:00:00:00:00" : config.mac_addr;
+            String info = (TextUtils.isEmpty(config.info)) ? "" : config.info;
+            String curve = (TextUtils.isEmpty(config.curve)) ? "" : config.curve;
+            String key = (TextUtils.isEmpty(config.key)) ? "" : config.key;
+
+            ISupplicantVendorStaIface iface =
+                   checkSupplicantVendorStaIfaceAndLogFailure(ifaceName, methodStr);
+            if (iface == null) return -1;
+            try {
+                iface.dppBootstrapGenerate(config.bootstrap_type,
+                            chan_list, NativeUtil.macAddressToByteArray(mac_addr),
+                            info, curve, key,
+                        (SupplicantStatus status, int hdl) -> {
+                            if (checkVendorStatusAndLogFailure(status, methodStr)) {
+                                handle.value = hdl;
+                            }
+                        });
+            } catch (RemoteException e) {
+                handleRemoteException(e, methodStr);
+            }
+            return handle.value;
+        }
+    }
+
+    /**
+     * Get bootstrap URI based on bootstrap ID
+     *
+     * @param ifaceName Name of the interface.
+     * @param bootstrap_id: Stored bootstrap ID
+     *
+     * @return: URI string else -1 on failure
+     */
+    public String dppGetUri(@NonNull String ifaceName, int bootstrap_id) {
+        synchronized (mLock) {
+            final String methodStr = "dppGetUri";
+            final Mutable<String> URI = new Mutable<>();
+            ISupplicantVendorStaIface iface =
+                   checkSupplicantVendorStaIfaceAndLogFailure(ifaceName, methodStr);
+            if (iface == null) return "-1";
+            try {
+                iface.dppGetUri(bootstrap_id,
+                        (SupplicantStatus status, String uri) -> {
+                            if (checkVendorStatusAndLogFailure(status, methodStr)) {
+                                URI.value = uri;
+                            }
+                        });
+            } catch (RemoteException e) {
+                handleRemoteException(e, methodStr);
+            }
+            return URI.value;
+        }
+    }
+
+    /**
+     * Remove bootstrap URI based on bootstrap ID.
+     *
+     * @param ifaceName Name of the interface.
+     * @param bootstrap_id: Stored bootstrap ID
+     *
+     * @return: 0 – Success or -1 on failure
+     */
+    public int dppBootstrapRemove(@NonNull String ifaceName, int bootstrap_id) {
+        synchronized (mLock) {
+            final String methodStr = "dppBootstrapRemove";
+            final MutableInt handle = new MutableInt(-1);
+            ISupplicantVendorStaIface iface =
+                   checkSupplicantVendorStaIfaceAndLogFailure(ifaceName, methodStr);
+            if (iface == null) return -1;
+            try {
+                iface.dppBootstrapRemove(bootstrap_id,
+                        (SupplicantStatus status, int hdl) -> {
+                            if (checkVendorStatusAndLogFailure(status, methodStr)) {
+                                handle.value = hdl;
+                            }
+                        });
+            } catch (RemoteException e) {
+                handleRemoteException(e, methodStr);
+            }
+            return handle.value;
+        }
+    }
+
+    /**
+     * start listen on the channel specified waiting to receive
+     * the DPP Authentication request.
+     *
+     * @param ifaceName Name of the interface.
+     * @param frequency: DPP listen frequency
+     * @param dpp_role: Configurator/Enrollee role
+     * @param qr_mutual: Mutual authentication required
+     * @param netrole_ap: network role
+     *
+     * @return: Returns 0 if a DPP-listen work is successfully
+     *  queued and -1 on failure.
+     */
+    public int dppListen(@NonNull String ifaceName, String frequency, int dpp_role,
+                         boolean qr_mutual, boolean netrole_ap) {
+        if (TextUtils.isEmpty(frequency)) return -1;
+        synchronized (mLock) {
+            final String methodStr = "dppListen";
+            final MutableInt handle = new MutableInt(-1);
+            ISupplicantVendorStaIface iface =
+                   checkSupplicantVendorStaIfaceAndLogFailure(ifaceName, methodStr);
+            if (iface == null) return -1;
+            try {
+                iface.dppStartListen(frequency, dpp_role,
+                        qr_mutual, netrole_ap,
+                        (SupplicantStatus status, int hdl) -> {
+                            if (checkVendorStatusAndLogFailure(status, methodStr)) {
+                                handle.value = hdl;
+                            }
+                        });
+            } catch (RemoteException e) {
+                handleRemoteException(e, methodStr);
+            }
+            return handle.value;
+        }
+    }
+
+    /**
+     * stop ongoing dpp listen.
+     *
+     * @param ifaceName Name of the interface.
+     * @return true if request is sent successfully, false otherwise.
+     */
+    public boolean dppStopListen(@NonNull String ifaceName) {
+        synchronized (mLock) {
+            final String methodStr = "dppStopListen";
+            ISupplicantVendorStaIface iface =
+                   checkSupplicantVendorStaIfaceAndLogFailure(ifaceName, methodStr);
+            if (iface == null) return false;
+            try {
+                SupplicantStatus status = iface.dppStopListen();
+                return checkVendorStatusAndLogFailure(status, methodStr);
+            } catch (RemoteException e) {
+                handleRemoteException(e, methodStr);
+                return false;
+            }
+        }
+    }
+
+    /**
+     * Adds the DPP configurator
+     *
+     * @param ifaceName Name of the interface.
+     * @param curve curve used for dpp encryption
+     * @param key private key
+     * @param expiry timeout in seconds
+     *
+     * @return: Identifier of the added configurator or -1 on failure
+     */
+    public int dppConfiguratorAdd(@NonNull String ifaceName, String curve,
+                                  String key, int expiry) {
+        String curve_t = (TextUtils.isEmpty(curve)) ? "" : curve;
+        String key_t = (TextUtils.isEmpty(key)) ? "" : key;
+        synchronized (mLock) {
+            final String methodStr = "dppConfiguratorAdd";
+            final MutableInt handle = new MutableInt(-1);
+            ISupplicantVendorStaIface iface =
+                   checkSupplicantVendorStaIfaceAndLogFailure(ifaceName, methodStr);
+            if (iface == null) return -1;
+            try {
+                iface.dppConfiguratorAdd(curve_t, key_t, expiry,
+                        (SupplicantStatus status, int hdl) -> {
+                            if (checkVendorStatusAndLogFailure(status, methodStr)) {
+                                handle.value = hdl;
+                            }
+                        });
+            } catch (RemoteException e) {
+                handleRemoteException(e, methodStr);
+            }
+            return handle.value;
+        }
+    }
+
+    /**
+     * Remove the added configurator through dppConfiguratorAdd.
+     *
+     * @param ifaceName Name of the interface.
+     * @param config_id: DPP Configurator ID
+     *
+     * @return: Handle to strored info else -1 on failure
+     */
+    public int dppConfiguratorRemove(@NonNull String ifaceName, int config_id) {
+        synchronized (mLock) {
+            final String methodStr = "dppConfiguratorRemove";
+            final MutableInt handle = new MutableInt(-1);
+            ISupplicantVendorStaIface iface =
+                   checkSupplicantVendorStaIfaceAndLogFailure(ifaceName, methodStr);
+            if (iface == null) return -1;
+            try {
+                iface.dppConfiguratorRemove(config_id,
+                        (SupplicantStatus status, int hdl) -> {
+                            if (checkVendorStatusAndLogFailure(status, methodStr)) {
+                                handle.value = hdl;
+                            }
+                        });
+            } catch (RemoteException e) {
+                handleRemoteException(e, methodStr);
+            }
+            return handle.value;
+        }
+    }
+
+    /**
+     * Start DPP authentication and provisioning with the specified peer
+     *
+     * @param ifaceName Name of the interface.
+     * @param config – dpp auth init config
+     *
+     * @return: 0 if DPP Authentication request was transmitted and -1 on failure
+     */
+    public int  dppStartAuth(@NonNull String ifaceName, WifiDppConfig config) {
+        String ssid = (TextUtils.isEmpty(config.ssid)) ? "" : config.ssid;
+        String passphrase = (TextUtils.isEmpty(config.passphrase)) ? "" : config.passphrase;
+        synchronized (mLock) {
+            final String methodStr = "dppStartAuth";
+            final MutableInt Status = new MutableInt(-1);
+            ISupplicantVendorStaIface iface =
+                   checkSupplicantVendorStaIfaceAndLogFailure(ifaceName, methodStr);
+            if (iface == null) return -1;
+            try {
+                iface.dppStartAuth(config.peer_bootstrap_id,
+                            config.own_bootstrap_id, config.dpp_role,
+                            ssid, passphrase, (config.isAp > 0) ? true : false,
+                            (config.isDpp > 0) ? true: false, config.conf_id, config.expiry,
+                        (SupplicantStatus status, int hdl) -> {
+                            if (checkVendorStatusAndLogFailure(status, methodStr)) {
+                                Status.value = hdl;
+                            }
+                        });
+            } catch (RemoteException e) {
+                handleRemoteException(e, methodStr);
+            }
+            return Status.value;
+        }
+    }
+
+    /**
+     * Retrieve Private key to be used for configurator
+     *
+     * @param ifaceName Name of the interface.
+     * @param id: id of configurator obj
+     *
+     * @return: Key string else -1 on failure
+     */
+    public String dppConfiguratorGetKey(@NonNull String ifaceName, int id) {
+        synchronized (mLock) {
+            final String methodStr = "dppConfiguratorGetKey";
+            final Mutable<String> KEY = new Mutable<>();
+            ISupplicantVendorStaIface iface =
+                   checkSupplicantVendorStaIfaceAndLogFailure(ifaceName, methodStr);
+            if (iface == null) return "-1";
+            try {
+                iface.dppConfiguratorGetKey(id,
+                        (SupplicantStatus status, String key) -> {
+                            if (checkVendorStatusAndLogFailure(status, methodStr)) {
+                                KEY.value = key;
+                            }
+                        });
+            } catch (RemoteException e) {
+                handleRemoteException(e, methodStr);
+            }
+            return KEY.value;
+        }
+    }
+
+    /*
      * Adds a DPP peer URI to the URI list.
      *
      *  This is a v1.2+ HAL feature.
@@ -3392,5 +4306,171 @@ public class SupplicantStaIfaceHal {
      */
     public void registerDppCallback(DppEventCallback dppCallback) {
         mDppCallback = dppCallback;
+    }
+
+    protected vendor.qti.hardware.wifi.supplicant.V2_1.ISupplicantVendorStaIface
+    getSupplicantVendorStaIfaceV2_1Mockable(ISupplicantVendorStaIface vendorIfaceV2_0) {
+        if (vendorIfaceV2_0 == null) return null;
+        return vendor.qti.hardware.wifi.supplicant.V2_1.ISupplicantVendorStaIface.castFrom(
+                vendorIfaceV2_0);
+    }
+
+    public WifiNative.WifiGenerationStatus getWifiGenerationStatus(@NonNull String ifaceName) {
+        synchronized (mLock) {
+            final String methodStr = "getWifiGenerationStatus";
+            final Mutable<WifiNative.WifiGenerationStatus> STATUS = new Mutable<>();
+            ISupplicantVendorStaIface vendorIfaceV2_0 = getVendorStaIface(ifaceName);
+            if (vendorIfaceV2_0 == null) {
+                Log.e(TAG, "Can't call " + methodStr + ", ISupplicantVendorStaIface is null");
+                return null;
+            }
+
+            vendor.qti.hardware.wifi.supplicant.V2_1.ISupplicantVendorStaIface vendorIfaceV2_1;
+            vendorIfaceV2_1 = getSupplicantVendorStaIfaceV2_1Mockable(vendorIfaceV2_0);
+            if (vendorIfaceV2_1 == null) {
+                Log.e(TAG, "Can't call " + methodStr + ", V2_1.ISupplicantVendorStaIface is null");
+                return null;
+            }
+
+            try {
+                vendorIfaceV2_1.getWifiGenerationStatus((SupplicantStatus status, WifiGenerationStatus generationStatus) -> {
+                            if (checkVendorStatusAndLogFailure(status, methodStr)) {
+                                STATUS.value = new WifiNative.WifiGenerationStatus(generationStatus.generation,
+                                                                                   generationStatus.vhtMax8SpatialStreamsSupport,
+                                                                                   generationStatus.twtSupport);
+                            }
+                        });
+            } catch (RemoteException e) {
+                handleRemoteException(e, methodStr);
+            }
+            return STATUS.value;
+        }
+    }
+
+    public boolean updateLinkedNetworksIfCurrent(@NonNull String ifaceName, int networkId,
+                           HashMap<String, WifiConfiguration> linkedConfigurations) {
+        synchronized (mLock) {
+            WifiConfiguration currentConfig = getCurrentNetworkLocalConfig(ifaceName);
+            SupplicantStaNetworkHal currentHandle = getCurrentNetworkRemoteHandle(ifaceName);
+
+            if (currentConfig == null || currentHandle == null) {
+                Log.e(TAG, "updateLinkedNetworksIfCurrent failed, got null current network");
+                return false;
+            }
+
+            if (currentConfig.networkId != networkId) {
+                Log.e(TAG, "updateLinkedNetworksIfCurrent failed, current network id is not matched");
+                return false;
+            }
+
+            if (!currentHandle.getId()) {
+                Log.e(TAG, "updateLinkedNetworksIfCurrent getId failed");
+                return false;
+            }
+
+            if (!removeLinkedNetworks(ifaceName, currentHandle.getNetworkId())) {
+                Log.e(TAG, "updateLinkedNetworksIfCurrent failed, couldn't remove existing linked networks");
+                return false;
+            }
+
+            mLinkedNetworkLocalAndRemoteConfigs.remove(ifaceName);
+
+            if (linkedConfigurations == null || linkedConfigurations.size() == 0) {
+                Log.e(TAG, "received zero linked networks");
+                return true;
+            }
+
+            ArrayList<Pair<SupplicantStaNetworkHal, WifiConfiguration>> linkedNetworkHandles
+                = new ArrayList<Pair<SupplicantStaNetworkHal, WifiConfiguration>>();
+
+            linkedNetworkHandles.add(new Pair(mCurrentNetworkRemoteHandles.get(ifaceName),
+                                              mCurrentNetworkLocalConfigs.get(ifaceName)));
+            for (String linkedNetwork : linkedConfigurations.keySet()) {
+                Log.e(TAG, "updateLinkedNetworksIfCurrent: add linked network: " + linkedNetwork);
+                Pair<SupplicantStaNetworkHal, WifiConfiguration> pair =
+                        addNetworkAndSaveConfig(ifaceName, linkedConfigurations.get(linkedNetwork));
+                if (pair == null) {
+                    Log.e(TAG, "updateLinkedNetworksIfCurrent failed to add/save linked network: "
+                             + linkedNetwork);
+                    return false;
+                }
+                pair.first.enable(true);
+                linkedNetworkHandles.add(pair);
+            }
+
+            mLinkedNetworkLocalAndRemoteConfigs.put(ifaceName, linkedNetworkHandles);
+
+            return true;
+        }
+    }
+
+    /**
+     * Remove linked networks from supplicant
+     *
+     * @param ifaceName Name of the interface.
+     */
+    private boolean removeLinkedNetworks(@NonNull String ifaceName, int currentNetworkId) {
+        synchronized (mLock) {
+            ArrayList<Integer> networks = listNetworks(ifaceName);
+            if (networks == null) {
+                Log.e(TAG, "removeLinkedNetworks failed, got null networks");
+                return false;
+            }
+            for (int id : networks) {
+                if (currentNetworkId == id) continue;
+                if (!removeNetwork(ifaceName, id)) {
+                    Log.e(TAG, "removeLinkedNetworks failed to remove network: " + id);
+                    return false;
+                }
+            }
+            return true;
+        }
+    }
+
+    protected vendor.qti.hardware.wifi.supplicant.V2_2.ISupplicantVendorStaIface
+        getSupplicantVendorStaIfaceV2_2Mockable(ISupplicantVendorStaIface vendorIfaceV2_0) {
+        if (vendorIfaceV2_0 == null) return null;
+        return vendor.qti.hardware.wifi.supplicant.V2_2.ISupplicantVendorStaIface.castFrom(
+                vendorIfaceV2_0);
+    }
+
+    /**
+     * run Driver command
+     *
+     * @param ifaceName Interface Name
+     * @param command Driver Command
+     */
+    public String doDriverCmd(String ifaceName, String command)
+    {
+        synchronized (mLock) {
+            final String methodStr = "doDriverCmd";
+            final Mutable<String> reply = new Mutable<>();
+
+            reply.value = "";
+            ISupplicantVendorStaIface vendorIfaceV2_0 = getVendorStaIface(ifaceName);
+            if (vendorIfaceV2_0 == null) {
+                Log.e(TAG, "Can't call " + methodStr + ", ISupplicantVendorStaIface is null");
+                return null;
+            }
+
+            vendor.qti.hardware.wifi.supplicant.V2_2.ISupplicantVendorStaIface vendorIfaceV2_2;
+            vendorIfaceV2_2 = getSupplicantVendorStaIfaceV2_2Mockable(vendorIfaceV2_0);
+            if (vendorIfaceV2_2 == null) {
+                Log.e(TAG, "Can't call " + methodStr + ", V2_2.ISupplicantVendorStaIface is null");
+                return null;
+            }
+
+            try {
+                vendorIfaceV2_2.doDriverCmd(command,
+                        (SupplicantStatus status, String rply) -> {
+                        if(checkVendorStatusAndLogFailure(status, methodStr)) {
+                            reply.value = rply;
+                     }
+                });
+            } catch (RemoteException e) {
+                handleRemoteException(e, methodStr);
+            }
+            return reply.value;
+         }
     }
 }

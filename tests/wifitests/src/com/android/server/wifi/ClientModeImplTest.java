@@ -122,6 +122,7 @@ import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.BitSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CountDownLatch;
@@ -2707,6 +2708,7 @@ public class ClientModeImplTest {
                 .thenReturn(TEST_LOCAL_MAC_ADDRESS.toString());
 
         WifiConfiguration config = mock(WifiConfiguration.class);
+        config.allowedKeyManagement = mock(BitSet.class);
         config.macRandomizationSetting = WifiConfiguration.RANDOMIZATION_NONE;
         when(config.getNetworkSelectionStatus())
                 .thenReturn(new WifiConfiguration.NetworkSelectionStatus());
@@ -2739,6 +2741,7 @@ public class ClientModeImplTest {
         assertEquals(WifiManager.WIFI_STATE_ENABLED, mCmi.syncGetWifiState());
 
         WifiConfiguration config = mock(WifiConfiguration.class);
+        config.allowedKeyManagement = mock(BitSet.class);
         config.macRandomizationSetting = WifiConfiguration.RANDOMIZATION_NONE;
         when(config.getNetworkSelectionStatus())
                 .thenReturn(new WifiConfiguration.NetworkSelectionStatus());
@@ -2788,6 +2791,7 @@ public class ClientModeImplTest {
         assertEquals(WifiManager.WIFI_STATE_ENABLED, mCmi.syncGetWifiState());
 
         WifiConfiguration config = mock(WifiConfiguration.class);
+        config.allowedKeyManagement = mock(BitSet.class);
         config.macRandomizationSetting = WifiConfiguration.RANDOMIZATION_PERSISTENT;
         when(config.getOrCreateRandomizedMacAddress())
                 .thenReturn(MacAddress.fromString(WifiInfo.DEFAULT_MAC_ADDRESS));

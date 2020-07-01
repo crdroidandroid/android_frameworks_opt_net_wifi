@@ -43,6 +43,7 @@ public class WifiTrafficPoller {
     private int mDataActivity;
 
     private final ExternalCallbackTracker<ITrafficStateCallback> mRegisteredCallbacks;
+    private String mInterface;
 
     WifiTrafficPoller(@NonNull Looper looper) {
         mRegisteredCallbacks = new ExternalCallbackTracker<ITrafficStateCallback>(
@@ -65,6 +66,12 @@ public class WifiTrafficPoller {
      */
     public void removeCallback(int callbackIdentifier) {
         mRegisteredCallbacks.remove(callbackIdentifier);
+    }
+
+    void setInterface(String iface) {
+        mTxPkts = mRxPkts = 0;
+        mDataActivity = 0;
+        mInterface = iface;
     }
 
     void notifyOnDataActivity(long txPkts, long rxPkts) {

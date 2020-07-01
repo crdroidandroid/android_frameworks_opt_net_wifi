@@ -108,6 +108,12 @@ public class WificondControl implements IBinder.DeathRecipient {
     private boolean mIsEnhancedOpenSupportedInitialized = false;
     private boolean mIsEnhancedOpenSupported;
 
+    private boolean mReport8SS = false;
+    private boolean mIsWifiGenerationCapabilitiesFetched =  false;
+    private WifiNative.WifiGenerationCapabilities mWifiGenerationCapabilities;
+
+    private static final int MAX_SSID_LEN = 32;
+
     private class ScanEventHandler extends IScanEvent.Stub {
         private String mIfaceName;
 
@@ -365,6 +371,38 @@ public class WificondControl implements IBinder.DeathRecipient {
     }
 
     /**
+     * Unsubscribe scan for specific STA interface configured in wificond.
+     * Additionally, trigger stopPnoScan() before invalidating wificond scanner object.
+     *
+     * @return Returns true on success.
+     */
+    public boolean unsubscribeScan(@NonNull String ifaceName) {
+        if (getClientInterface(ifaceName) == null) {
+            Log.e(TAG, "No valid wificond client interface handler");
+            return false;
+        }
+
+        // stop any active pno scan
+        stopPnoScan(ifaceName);
+
+        try {
+            IWifiScannerImpl scannerImpl = mWificondScanners.get(ifaceName);
+            if (scannerImpl != null) {
+                scannerImpl.unsubscribeScanEvents();
+                scannerImpl.unsubscribePnoScanEvents();
+            }
+        } catch (RemoteException e) {
+            Log.e(TAG, "Failed to unsubscribe wificond scanner due to remote exception");
+            return false;
+        }
+
+        mWificondScanners.remove(ifaceName);
+        mScanEventHandlers.remove(ifaceName);
+        mPnoScanEventHandlers.remove(ifaceName);
+        return true;
+    }
+
+    /**
      * Teardown a specific STA interface configured in wificond.
      *
      * @return Returns true on success.
@@ -579,6 +617,21 @@ public class WificondControl implements IBinder.DeathRecipient {
             } else {
                 nativeResults = scannerImpl.getPnoScanResults();
             }
+            WifiNative.WifiGenerationCapabilities wifiGenerationCapa;
+
+            if(mIsWifiGenerationCapabilitiesFetched == true) {
+                wifiGenerationCapa = mWifiGenerationCapabilities;
+            }
+            else {
+                wifiGenerationCapa =  getWifiGenerationCapabilities();
+                // wifiGenerationCapa is null means failed to fetch generation capabilities
+                if(wifiGenerationCapa != null) {
+                    mReport8SS = mWifiInjector.getReport8SS();
+                    mWifiGenerationCapabilities = wifiGenerationCapa;
+                    mIsWifiGenerationCapabilitiesFetched = true;
+                }
+            }
+
             for (NativeScanResult result : nativeResults) {
                 WifiSsid wifiSsid = WifiSsid.createFromByteArray(result.ssid);
                 String bssid;
@@ -596,6 +649,18 @@ public class WificondControl implements IBinder.DeathRecipient {
                         InformationElementUtil.parseInformationElements(result.infoElement);
                 InformationElementUtil.Capabilities capabilities =
                         new InformationElementUtil.Capabilities();
+                if (wifiGenerationCapa != null && result.frequency < 3000) {
+                    capabilities.reportHt = wifiGenerationCapa.htSupport2g;
+                    // Do not include subset of VHT on 2.4 GHz vendor extension
+                    // in consideration for reporting VHT.
+                    capabilities.reportVht = false;
+                    capabilities.reportHe = wifiGenerationCapa.staHeSupport2g;
+                } else if (wifiGenerationCapa != null) {
+                    capabilities.reportHt = wifiGenerationCapa.htSupport5g;
+                    capabilities.reportVht = wifiGenerationCapa.vhtSupport5g;
+                    capabilities.reportHe = wifiGenerationCapa.staHeSupport5g;
+                }
+                capabilities.report8SS = mReport8SS;
                 capabilities.from(ies, result.capability, isEnhancedOpenSupported());
                 String flags = capabilities.generateCapabilitiesString();
                 NetworkDetail networkDetail;
@@ -697,9 +762,14 @@ public class WificondControl implements IBinder.DeathRecipient {
             for (String ssid : hiddenNetworkSSIDs) {
                 HiddenNetwork network = new HiddenNetwork();
                 try {
-                    network.ssid = NativeUtil.byteArrayFromArrayList(NativeUtil.decodeSsid(ssid));
+                    network.ssid = WifiGbk.getRandUtfOrGbkBytes(ssid); // wifigbk++
                 } catch (IllegalArgumentException e) {
                     Log.e(TAG, "Illegal argument " + ssid, e);
+                    continue;
+                }
+                if (network.ssid.length > MAX_SSID_LEN) {
+                    Log.e(TAG, "SSID is too long after conversion, skipping this ssid! SSID = " +
+                                network.ssid + " , network.ssid.size = " + network.ssid.length);
                     continue;
                 }
                 // settings.hiddenNetworks is expected to be very small, so this shouldn't cause
@@ -748,7 +818,21 @@ public class WificondControl implements IBinder.DeathRecipient {
                     continue;
                 }
                 condNetwork.frequencies = network.frequencies;
-                settings.pnoNetworks.add(condNetwork);
+                if (condNetwork.ssid.length <= WifiGbk.MAX_SSID_LENGTH) { //wifigbk++
+                    settings.pnoNetworks.add(condNetwork);
+                }
+                //wifigbk++
+                if (!WifiGbk.isAllAscii(condNetwork.ssid)) {
+                    PnoNetwork condNetwork2 = new PnoNetwork();
+                    condNetwork2.isHidden = condNetwork.isHidden;
+                    condNetwork2.ssid = WifiGbk.toGbk(condNetwork.ssid);
+                    condNetwork2.frequencies = condNetwork.frequencies;
+                    if (condNetwork2.ssid != null) {
+                        settings.pnoNetworks.add(condNetwork2);
+                        Log.i(TAG, "WifiGbk fixed - pnoScan add extra Gbk ssid for " + network.ssid);
+                    }
+                }
+                //wifigbk--
             }
         }
 
@@ -952,5 +1036,58 @@ public class WificondControl implements IBinder.DeathRecipient {
         mIsEnhancedOpenSupported = (mWifiNative.getSupportedFeatureSet(iface)
                 & WIFI_FEATURE_OWE) != 0;
         return mIsEnhancedOpenSupported;
+    }
+
+    /**
+     * Query the Wi-Fi generation capabilities for 2G and 5G bands.
+     *
+     * @return WifiNative.WifiGenerationCapabilities object, or null for error.
+     */
+    public WifiNative.WifiGenerationCapabilities getWifiGenerationCapabilities() {
+        if (!retrieveWificondAndRegisterForDeath()) {
+            return null;
+        }
+
+        int wifiGenerationCapaMask = 0;
+        try {
+            wifiGenerationCapaMask = mWificond.QcGetWifiGenerationCapabilities();
+        } catch (RemoteException e1) {
+            Log.e(TAG, "Failed to request getWifiGenerationCapabilities due to remote exception");
+            return null;
+        }
+
+        if (wifiGenerationCapaMask == -1) {
+            Log.e(TAG, "Failed to get Wifi generation capabilities.");
+            return null;
+        }
+
+	WifiNative.WifiGenerationCapabilities wifiGenerationCapa = new WifiNative.WifiGenerationCapabilities();
+
+        if ((wifiGenerationCapaMask & (1 << IWificond.QC_2G_HT_SUPPORT)) != 0) {
+            wifiGenerationCapa.htSupport2g = true;
+        }
+        if ((wifiGenerationCapaMask & (1 << IWificond.QC_2G_VHT_SUPPORT)) != 0) {
+            wifiGenerationCapa.vhtSupport2g = true;
+        }
+        if ((wifiGenerationCapaMask & (1 << IWificond.QC_2G_STA_HE_SUPPORT)) != 0) {
+            wifiGenerationCapa.staHeSupport2g = true;
+        }
+        if ((wifiGenerationCapaMask & (1 << IWificond.QC_2G_SAP_HE_SUPPORT)) != 0) {
+            wifiGenerationCapa.sapHeSupport2g = true;
+        }
+        if ((wifiGenerationCapaMask & (1 << IWificond.QC_5G_HT_SUPPORT)) != 0) {
+            wifiGenerationCapa.htSupport5g = true;
+        }
+        if ((wifiGenerationCapaMask & (1 << IWificond.QC_5G_VHT_SUPPORT)) != 0) {
+            wifiGenerationCapa.vhtSupport5g = true;
+        }
+        if ((wifiGenerationCapaMask & (1 << IWificond.QC_5G_STA_HE_SUPPORT)) != 0) {
+            wifiGenerationCapa.staHeSupport5g = true;
+        }
+        if ((wifiGenerationCapaMask & (1 << IWificond.QC_5G_SAP_HE_SUPPORT)) != 0) {
+            wifiGenerationCapa.sapHeSupport5g = true;
+        }
+
+        return wifiGenerationCapa;
     }
 }

@@ -157,6 +157,7 @@ public class WifiInjector {
     private final CellularLinkLayerStatsCollector mCellularLinkLayerStatsCollector;
     private final MacAddressUtil mMacAddressUtil;
     private final ConnectionFailureNotificationBuilder mConnectionFailureNotificationBuilder;
+    private final FstManagerGroupHal mFstManagerGroupHal;
 
     public WifiInjector(Context context) {
         if (context == null) {
@@ -222,10 +223,12 @@ public class WifiInjector {
                 clientModeImplLooper, mClock);
         mNwManagementService = INetworkManagementService.Stub.asInterface(
                 ServiceManager.getService(Context.NETWORKMANAGEMENT_SERVICE));
+        mFstManagerGroupHal = new FstManagerGroupHal(clientModeImplLooper);
         mWifiNative = new WifiNative(
                 mWifiVendorHal, mSupplicantStaIfaceHal, mHostapdHal, mWificondControl,
                 mWifiMonitor, mNwManagementService, mPropertyService, mWifiMetrics,
-                new Handler(mWifiCoreHandlerThread.getLooper()), new Random());
+                new Handler(mWifiCoreHandlerThread.getLooper()), new Random(),
+                mFstManagerGroupHal);
         mWifiP2pMonitor = new WifiP2pMonitor(this);
         mSupplicantP2pIfaceHal = new SupplicantP2pIfaceHal(mWifiP2pMonitor);
         mWifiP2pNative = new WifiP2pNative(
@@ -234,7 +237,7 @@ public class WifiInjector {
 
         // Now get instances of all the objects that depend on the HandlerThreads
         mWifiTrafficPoller = new WifiTrafficPoller(clientModeImplLooper);
-        mCountryCode = new WifiCountryCode(mWifiNative,
+        mCountryCode = new WifiCountryCode(mContext, mWifiNative,
                 SystemProperties.get(BOOT_DEFAULT_WIFI_COUNTRY_CODE),
                 mContext.getResources()
                         .getBoolean(R.bool.config_wifi_revert_country_code_on_cellular_loss));
@@ -247,7 +250,7 @@ public class WifiInjector {
         mWifiKeyStore = new WifiKeyStore(mKeyStore);
         mWifiConfigStore = new WifiConfigStore(
                 mContext, clientModeImplLooper, mClock, mWifiMetrics,
-                WifiConfigStore.createSharedFile(mFrameworkFacade.isNiapModeOn(mContext)));
+                mFrameworkFacade.isNiapModeOn(mContext),WifiManager.STA_PRIMARY);
         SubscriptionManager subscriptionManager =
                 mContext.getSystemService(SubscriptionManager.class);
         // Config Manager
@@ -332,6 +335,8 @@ public class WifiInjector {
                 new WakeupEvaluator(mScoringParams), wakeupOnboarding, mWifiConfigManager,
                 mWifiConfigStore, mWifiNetworkSuggestionsManager, mWifiMetrics.getWakeupMetrics(),
                 this, mFrameworkFacade, mClock);
+        if (mClientModeImpl != null)
+            mClientModeImpl.setWifiDiagnostics(mWifiDiagnostics);
         mLockManager = new WifiLockManager(mContext, BatteryStatsService.getService(),
                 mClientModeImpl, mFrameworkFacade, new Handler(clientModeImplLooper), mWifiNative,
                 mClock, mWifiMetrics);
@@ -372,11 +377,13 @@ public class WifiInjector {
         return sWifiInjector;
     }
 
+    private int mVerboseLoggingEnabled = 0;
     /**
      * Enable verbose logging in Injector objects. Called from the WifiServiceImpl (based on
      * binder call).
      */
     public void enableVerboseLogging(int verbose) {
+        mVerboseLoggingEnabled = verbose;
         mWifiLastResortWatchdog.enableVerboseLogging(verbose);
         mWifiBackupRestore.enableVerboseLogging(verbose);
         mHalDeviceManager.enableVerboseLogging(verbose);
@@ -386,6 +393,7 @@ public class WifiInjector {
         mWifiNetworkSuggestionsManager.enableVerboseLogging(verbose);
         LogcatLog.enableVerboseLogging(verbose);
         mDppManager.enableVerboseLogging(verbose);
+        mActiveModeWarden.enableVerboseLogging(verbose);
     }
 
     public UserManager getUserManager() {
@@ -526,6 +534,11 @@ public class WifiInjector {
 
     public DppManager getDppManager() {
         return mDppManager;
+    }
+
+    public boolean getReport8SS()
+    {
+        return (mContext.getResources().getBoolean(com.android.internal.R.bool.config_wifi_report_he_ready));
     }
 
     /** Gets IWificond without caching. */
@@ -785,5 +798,76 @@ public class WifiInjector {
 
     public String getWifiStackPackageName() {
         return mContext.getPackageName();
+    }
+
+    /**
+     * Create QtiWifiConfigManager
+     * @param id interface id.
+     */
+    private WifiConfigManager makeQtiWifiConfigManager(int id) {
+        WifiConfigStore mQtiWifiConfigStore = new WifiConfigStore(mContext, mWifiCoreHandlerThread.getLooper(), mClock, mWifiMetrics,mFrameworkFacade.isNiapModeOn(mContext),id);
+        return new WifiConfigManager(mContext, mClock,UserManager.get(mContext), makeTelephonyManager(),
+                 mWifiKeyStore, mQtiWifiConfigStore, mWifiPermissionsUtil,
+                 mWifiPermissionsWrapper, this, new NetworkListSharedStoreData(mContext),
+                 new NetworkListUserStoreData(mContext),
+                 new DeletedEphemeralSsidsStoreData(mClock), new RandomizedMacStoreData(),
+                 mFrameworkFacade, mWifiCoreHandlerThread.getLooper(),mDeviceConfigFacade);
+    }
+
+
+    /**
+     * Create a QtiClientModeManager
+     *
+     * @param id interface id for  QtiClientModeManager
+     * @param listener listener for QtiClientModeManager state changes
+     * @return a new instance of QtiClientModeManager
+     */
+    public QtiClientModeManager makeQtiClientModeManager(int id, QtiClientModeManager.Listener listener) {
+        return new QtiClientModeManager(mContext, mWifiCoreHandlerThread.getLooper(),
+                mWifiNative, listener, this, id, makeQtiWifiConfigManager(id));
+    }
+
+    /**
+     * Construct a new instance of QtiClientModeImpl to manage addtional stations.
+     *
+     * Create and return a new QtiClientModeImpl.
+     * @param identity staId.
+     * @param listener listener for QtiClientModeManager state changes
+     */
+    public QtiClientModeImpl makeQtiClientModeImpl(int id, QtiClientModeManager.Listener listener, WifiConfigManager mQtiWifiConfigManager ) {
+        return new QtiClientModeImpl(mContext, mFrameworkFacade, mWifiCoreHandlerThread.getLooper(),
+                       this, mWifiNative, new WrongPasswordNotifier(mContext, mFrameworkFacade),
+                       mWifiTrafficPoller, mLinkProbeManager, id, listener, mQtiWifiConfigManager);
+    }
+
+    /**
+     * Construct a new instance of QtiWifiConnectivityManager and its dependencies.
+     *
+     * Create and return a new QtiWifiConnectivityManager.
+     * @param identity staId.
+     * @param qtiClientModeImpl Instance of client mode impl.
+     */
+    public QtiWifiConnectivityManager makeQtiWifiConnectivityManager(int id, QtiClientModeImpl qtiClientModeImpl, WifiConfigManager mQtiWifiConfigManager) {
+        WifiConnectivityHelper mQtiWifiConnectivityHelper = new WifiConnectivityHelper(mWifiNative);
+
+        WifiNetworkSelector mQtiWifiNetworkSelector = new WifiNetworkSelector(mContext, mWifiScoreCard,
+                                   mScoringParams, mQtiWifiConfigManager, mClock, mConnectivityLocalLog,
+                                   mWifiMetrics, mWifiNative);
+        SavedNetworkEvaluator mQtiSavedNetworkEvaluator = new SavedNetworkEvaluator(mContext, mScoringParams,
+                                   mQtiWifiConfigManager, mClock, mConnectivityLocalLog, mQtiWifiConnectivityHelper,
+                                   mContext.getSystemService(SubscriptionManager.class));
+        // Register the saved network evaluator with the network selector.
+        mQtiWifiNetworkSelector.registerNetworkEvaluator(mQtiSavedNetworkEvaluator);
+        // TODO: UT: check if we need to add PasspointNetworkEvaluator.
+
+
+        return new QtiWifiConnectivityManager(mContext, getScoringParams(),
+                qtiClientModeImpl, this, mQtiWifiConfigManager, mQtiWifiNetworkSelector,
+                mQtiWifiConnectivityHelper, mWifiCoreHandlerThread.getLooper(),
+                mClock, mConnectivityLocalLog, id);
+    }
+
+    public int getVerboseLogging() {
+        return mVerboseLoggingEnabled;
     }
 }

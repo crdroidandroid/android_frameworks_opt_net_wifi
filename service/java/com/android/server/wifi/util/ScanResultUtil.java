@@ -79,6 +79,30 @@ public class ScanResultUtil {
     }
 
     /**
+     * Helper method to check if the provided |scanResult| corresponds to FILS SHA256 network.
+     * This checks if the provided capabilities string contains FILS-SHA256 or not.
+     */
+    public static boolean isScanResultForFilsSha256Network(ScanResult scanResult) {
+        return scanResult.capabilities.contains("FILS-SHA256");
+    }
+
+    /**
+     * Helper method to check if the provided |scanResult| corresponds to FILS SHA384 network.
+     * This checks if the provided capabilities string contains FILS-SHA384 or not.
+     */
+    public static boolean isScanResultForFilsSha384Network(ScanResult scanResult) {
+        return scanResult.capabilities.contains("FILS-SHA384");
+    }
+
+    /**
+     * Helper method to check if the provided |scanResult| corresponds to DPP network.
+     * This checks if the provided capabilities string contains DPP or not.
+     */
+    public static boolean isScanResultForDppNetwork(ScanResult scanResult) {
+        return scanResult.capabilities.contains("DPP");
+    }
+
+    /**
      * Helper method to check if the provided |scanResult| corresponds to OWE network.
      * This checks if the provided capabilities string contains OWE or not.
      */
@@ -159,6 +183,10 @@ public class ScanResultUtil {
             config.setSecurityParams(WifiConfiguration.SECURITY_TYPE_WEP);
         } else if (isScanResultForOweNetwork(scanResult)) {
             config.setSecurityParams(WifiConfiguration.SECURITY_TYPE_OWE);
+        } else if (isScanResultForFilsSha256Network(scanResult)) {
+            config.setSecurityParams(WifiConfiguration.SECURITY_TYPE_FILS_SHA256);
+        } else if (isScanResultForFilsSha384Network(scanResult)) {
+            config.setSecurityParams(WifiConfiguration.SECURITY_TYPE_FILS_SHA384);
         } else {
             config.setSecurityParams(WifiConfiguration.SECURITY_TYPE_OPEN);
         }

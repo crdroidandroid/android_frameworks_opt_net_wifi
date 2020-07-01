@@ -2233,7 +2233,18 @@ public class WifiVendorHal {
                     for (String ssidStr : config.whitelistSsids) {
                         byte[] ssid = NativeUtil.byteArrayFromArrayList(
                                 NativeUtil.decodeSsid(ssidStr));
-                        roamingConfig.ssidWhitelist.add(ssid);
+                        if (ssid.length > 32) {
+                            throw new IllegalArgumentException("configureRoaming: ssid too long");
+                        }
+
+                        // StaRoamingConfig.ssidWhitelist is a list of byte arrays with fixed array size 32
+                        // Due to this HAL code is doesn't take byte arrays of length less than 32
+                        // Thus convert all ssids to byte arrays of 32 length
+                        byte[] ssid_32 = new byte[32];
+                        for (int i = 0; i < ssid.length; i++) {
+                            ssid_32[i] = ssid[i];
+                        }
+                        roamingConfig.ssidWhitelist.add(ssid_32);
                     }
                 }
 
@@ -2927,22 +2938,24 @@ public class WifiVendorHal {
     public class HalDeviceManagerStatusListener implements HalDeviceManager.ManagerStatusListener {
         @Override
         public void onStatusChanged() {
-            boolean isReady = mHalDeviceManager.isReady();
-            boolean isStarted = mHalDeviceManager.isStarted();
+            mHalEventHandler.post(() -> {
+                boolean isReady = mHalDeviceManager.isReady();
+                boolean isStarted = mHalDeviceManager.isStarted();
 
-            mVerboseLog.i("Device Manager onStatusChanged. isReady(): " + isReady
-                    + ", isStarted(): " + isStarted);
-            if (!isReady) {
-                // Probably something unpleasant, e.g. the server died
-                WifiNative.VendorHalDeathEventHandler handler;
-                synchronized (sLock) {
-                    clearState();
-                    handler = mDeathEventHandler;
+                mVerboseLog.i("Device Manager onStatusChanged. isReady(): " + isReady
+                        + ", isStarted(): " + isStarted);
+                if (!isReady) {
+                    // Probably something unpleasant, e.g. the server died
+                    WifiNative.VendorHalDeathEventHandler handler;
+                    synchronized (sLock) {
+                        clearState();
+                        handler = mDeathEventHandler;
+                    }
+                    if (handler != null) {
+                        handler.onDeath();
+                    }
                 }
-                if (handler != null) {
-                    handler.onDeath();
-                }
-            }
+            });
         }
     }
 }
