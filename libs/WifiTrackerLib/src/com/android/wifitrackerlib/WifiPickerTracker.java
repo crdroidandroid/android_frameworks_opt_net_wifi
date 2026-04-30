@@ -846,8 +846,17 @@ public class WifiPickerTracker extends BaseWifiTracker {
 
         // Remove any entry that is now unreachable due to no scans or unsupported
         // security types.
-        mStandardWifiEntryCache.removeIf(
-                entry -> entry.getLevel() == WIFI_LEVEL_UNREACHABLE);
+        mStandardWifiEntryCache.removeIf(entry -> {
+            if (entry.getLevel() == WIFI_LEVEL_UNREACHABLE) {
+                if (entry.getConnectedState() != WifiEntry.CONNECTED_STATE_DISCONNECTED) {
+                    Log.w(TAG, "Preventing removal of active entry despite being unreachable: "
+                            + entry.getTitle() + ", state: " + entry.getConnectedState());
+                    return false;
+                }
+                return true;
+            }
+            return false;
+        });
     }
 
     /**
